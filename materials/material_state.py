@@ -98,6 +98,7 @@ class MaterialStateManager:
         self.max_principal_stress = fem.Function(
             self.V_DG0, name="max_principal_stress"
         )
+        self.damage_max = fem.Function(self.V_DG0, name="damage_max")
 
         self.strain = fem.Function(self.V_DG0_tensor, name="strain")
         self.stress = fem.Function(self.V_DG0_tensor, name="stress")
@@ -171,6 +172,7 @@ class MaterialStateManager:
         self.yield_function_trial.x.array[:] = 0.0
         self.von_mises.x.array[:] = 0.0
         self.max_principal_stress.x.array[:] = 0.0
+        self.damage_max.x.array[:] = 0.0
         self.stress.x.array[:] = 0.0
         self.strain.x.array[:] = 0.0
 
@@ -186,6 +188,7 @@ class MaterialStateManager:
         self.yield_function_trial.x.scatter_forward()
         self.von_mises.x.scatter_forward()
         self.max_principal_stress.x.scatter_forward()
+        self.damage_max.x.scatter_forward()
         self.stress.x.scatter_forward()
         self.strain.x.scatter_forward()
 

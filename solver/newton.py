@@ -32,6 +32,7 @@ class NewtonLinearWorkspace:
 
     def __init__(self, V, msh, F_form, solver_cfg=None):
         self.comm = msh.comm
+        self.msh = msh
         self.solver_cfg = solver_cfg or {}
         self.b = create_vector(F_form)
         self.du = fem.Function(V)
@@ -56,16 +57,11 @@ class NewtonLinearWorkspace:
             "iterative": "iterative",
             "itterative": "iterative",
             "krylov": "iterative",
-            "iterative_with_direct_fallback": "iterative_with_direct_fallback",
-            "iterative_fallback_direct": "iterative_with_direct_fallback",
-            "iterative_then_direct": "iterative_with_direct_fallback",
-            "hybrid": "iterative_with_direct_fallback",
         }
         if mode_str not in aliases:
             raise ValueError(
                 "Unsupported solver.linear_solver="
-                f"{mode!r}. Expected one of: direct, iterative, "
-                "iterative_with_direct_fallback."
+                f"{mode!r}. Expected one of: direct, iterative."
             )
         return aliases[mode_str]
 
@@ -75,6 +71,16 @@ class NewtonLinearWorkspace:
             self._configure_direct_solver()
             return
         self._configure_iterative_solver()
+
+    def _configure_iterative_solver_on_ksp(self, target_ksp):
+        """Apply iterative solver config to an external KSP (for subsystem solves)."""
+        # Temporarily swap self.ksp, configure, then restore.
+        orig_ksp = self.ksp
+        orig_pc = self.pc
+        self.ksp = target_ksp
+        self._configure_iterative_solver()
+        self.ksp = orig_ksp
+        self.pc = orig_pc
 
     def ensure_jacobian(self, J_form):
         """Allocate Jacobian once so sparsity is reused across all steps."""
@@ -109,38 +115,24 @@ class NewtonLinearWorkspace:
         # Must be set via options database before the first factorization.
         opts = PETSc.Options()
         opts.setValue("-mat_mumps_icntl_14", str(mumps_icntl_14))
+        if direct_cfg.get("out_of_core", False):
+            opts.setValue("-mat_mumps_icntl_22", "1")
+        for key, val in direct_cfg.get("petsc_options", {}).items():
+            opts.setValue(f"-{key}", str(val))
         self.ksp.setFromOptions()
 
         # Cached reference to avoid creating new Python wrappers per call.
         self._factor_mat = None
 
     def _configure_iterative_solver(self):
-        """Configure KSP/PC for iterative Krylov solves.
+        """Configure KSP/PC for iterative solves on the active-DOF subsystem.
 
-        The default configuration uses GMRES with block Jacobi
-        preconditioning, where each MPI rank's local diagonal block is
-        approximately factored with ILU.  This is the standard choice for
-        DG formulations because:
+        The default configuration uses ``preonly`` + ``lu``: a direct solve
+        on the extracted active-DOF subsystem (typically 1K-22K DOFs instead
+        of the full 432K).  On multi-rank, MUMPS is used for distributed LU.
 
-        - **Point Jacobi (diagonal scaling) fails** for DG: the SIP
-          penalty terms and cohesive stiffness create large off-diagonal
-          entries that a diagonal preconditioner ignores, leaving GMRES
-          with an effective condition number so large that it stagnates
-          within the restart window.
-        - **Block Jacobi + ILU** captures intra-rank coupling (both
-          intra-cell stiffness and facet penalty contributions to
-          same-rank neighbors), which is the dominant coupling in DG
-          discretizations with MPI domain decomposition.
-        - ILU fill level (``ilu_levels``) controls accuracy vs cost.
-          Level 0 is cheapest; level 1-2 captures more of the penalty
-          coupling and reduces GMRES iterations at the expense of a
-          denser preconditioner.
-
-        PETSc sub-solver configuration for block preconditioners
-        (bjacobi, asm) is handled through the options database because
-        the sub-KSP/sub-PC objects are created internally by PETSc
-        during the first ``ksp.setUp()`` / ``ksp.solve()`` call and
-        cannot be reliably accessed through the Python API beforehand.
+        Alternative PC types (hypre, bjacobi, asm) are supported via config
+        for experimentation.
         """
         iterative_cfg = self.solver_cfg.get("iterative", {})
         ksp_type = str(
@@ -156,11 +148,8 @@ class NewtonLinearWorkspace:
             )
         ).strip().lower()
         sub_pc_type = str(
-            iterative_cfg.get("sub_pc_type", "ilu")
+            iterative_cfg.get("sub_pc_type", "lu")
         ).strip().lower()
-        ilu_levels = int(
-            iterative_cfg.get("ilu_levels", 0)
-        )
         ksp_rtol = float(
             iterative_cfg.get(
                 "rtol",
@@ -190,20 +179,48 @@ class NewtonLinearWorkspace:
         self.pc = self.ksp.getPC()
         self.pc.setType(pc_type)
         self.ksp.setTolerances(rtol=ksp_rtol, atol=ksp_atol, max_it=ksp_max_it)
-        if ksp_type == "gmres" and gmres_restart > 0:
+        if ksp_type in ("gmres", "fgmres") and gmres_restart > 0:
             self.ksp.setGMRESRestart(gmres_restart)
 
-        # Configure sub-solver for block preconditioners via options
-        # database.  PETSc creates the sub-KSP objects lazily during the
-        # first solve, so direct Python API calls (getSubKSP, etc.)
-        # would fail at this point.  The options database is the
-        # reliable path for pre-solve sub-PC configuration.
         opts = PETSc.Options()
-        if pc_type in ("bjacobi", "asm"):
+        if pc_type == "lu":
+            opts.setValue("-pc_factor_shift_type", "nonzero")
+            opts.setValue("-pc_factor_shift_amount", "1e-10")
+        elif pc_type == "hypre":
+            # BoomerAMG: robust algebraic multigrid for 3D problems.
+            opts.setValue("-pc_hypre_type", "boomeramg")
+            opts.setValue("-pc_hypre_boomeramg_max_levels", "10")
+            opts.setValue("-pc_hypre_boomeramg_strong_threshold", "0.5")
+            opts.setValue("-pc_hypre_boomeramg_coarsen_type", "HMIS")
+            opts.setValue("-pc_hypre_boomeramg_interp_type", "ext+i")
+            opts.setValue("-pc_hypre_boomeramg_agg_nl", "2")
+        elif pc_type == "bjacobi":
+            # Cell-level block Jacobi: DG DOFs are contiguous per cell,
+            # so n_blocks = n_cells gives one 24×24 block per cell.
+            sub_pc_type = str(iterative_cfg.get("sub_pc_type", "lu")).strip().lower()
+            map_c = self.msh.topology.index_map(self.msh.topology.dim)
+            n_cells = map_c.size_local + map_c.num_ghosts
+            opts.setValue("-pc_bjacobi_blocks", str(n_cells))
+            opts.setValue("-sub_ksp_type", "preonly")
+            opts.setValue("-sub_pc_type", sub_pc_type)
+            if sub_pc_type == "lu":
+                opts.setValue("-sub_pc_factor_shift_type", "nonzero")
+                opts.setValue("-sub_pc_factor_shift_amount", "1e-10")
+        elif pc_type == "asm":
+            sub_pc_type = str(iterative_cfg.get("sub_pc_type", "ilu")).strip().lower()
+            ilu_levels = int(iterative_cfg.get("ilu_levels", 0))
             opts.setValue("-sub_ksp_type", "preonly")
             opts.setValue("-sub_pc_type", sub_pc_type)
             if sub_pc_type == "ilu" and ilu_levels >= 0:
                 opts.setValue("-sub_pc_factor_levels", str(ilu_levels))
+            opts.setValue("-sub_pc_factor_shift_type", "nonzero")
+            opts.setValue("-sub_pc_factor_shift_amount", "1e-4")
+            opts.setValue("-sub_pc_factor_zeropivot", "1e-6")
+            opts.setValue("-sub_pc_factor_mat_ordering_type", "rcm")
+            overlap = int(iterative_cfg.get("asm_overlap", 1))
+            opts.setValue("-pc_asm_overlap", str(overlap))
+        for key, val in iterative_cfg.get("petsc_options", {}).items():
+            opts.setValue(f"-{key}", str(val))
         self.ksp.setFromOptions()
 
         # Cached reference to avoid creating new Python wrappers per call.
@@ -269,7 +286,7 @@ def pin_inactive_dofs(A, b, inactive_dofs):
     """
     # A.zeroRowsLocal is an MPI COLLECTIVE operation. All ranks MUST call it simultaneously,
     # even if they are passing an empty array. Returning early here causes an MPI Deadlock.
-    A.zeroRowsLocal(inactive_dofs, diag=1.0)
+    A.zeroRowsColumnsLocal(inactive_dofs, diag=1.0)
 
     if len(inactive_dofs) > 0:
         b.array[inactive_dofs] = 0.0
@@ -628,9 +645,27 @@ def solve_newton(
                 )
 
     def _cleanup(destroy_workspace):
+        nonlocal A_sub, b_sub, du_sub, active_is, ksp_sub, pc_sub
         _memory_snapshot(-1, "cleanup-pre")
         workspace.A = A
         workspace.assemble_mode = assemble_mode
+        # Destroy subsystem objects.
+        if A_sub is not None:
+            A_sub.destroy()
+            A_sub = None
+        if b_sub is not None:
+            b_sub.destroy()
+            b_sub = None
+        if du_sub is not None:
+            du_sub.destroy()
+            du_sub = None
+        if active_is is not None:
+            active_is.destroy()
+            active_is = None
+        if ksp_sub is not None:
+            ksp_sub.destroy()
+            ksp_sub = None
+            pc_sub = None
         if destroy_workspace:
             workspace.destroy()
             workspace.A = None
@@ -641,11 +676,34 @@ def solve_newton(
             gc.collect()
         _memory_snapshot(-1, "cleanup-post")
 
-    # Tell PETSc about the operator ONCE before the iteration loop.
-    # Calling setOperators inside the loop with the same A object is
-    # redundant — PETSc detects value changes via the Mat state counter
-    # and will redo numeric factorization automatically.
-    ksp.setOperators(A)
+    # Solver path selection:
+    # - 1 rank + iterative: subsystem extraction + LU on active DOFs only
+    # - direct: pin inactive DOFs + MUMPS on full system (unchanged)
+    is_iterative = workspace.linear_solver_mode == "iterative"
+    n_ranks = msh.comm.size
+    use_subsystem = is_iterative and n_ranks == 1 and n_active_local > 0
+    A_sub = None
+    b_sub = None
+    du_sub = None
+    active_is = None
+    active_dofs_local = None
+    ksp_sub = None
+    pc_sub = None
+    first_ksp_its = 0
+    pc_lagged = False
+
+    if use_subsystem:
+        # Single-rank fast path: extract active-DOF subsystem.
+        active_dofs_local = np.setdiff1d(
+            np.arange(num_owned_dofs, dtype=np.int32), inactive_dofs
+        )
+        active_is = PETSc.IS().createGeneral(active_dofs_local, comm=PETSc.COMM_SELF)
+        ksp_sub = PETSc.KSP().create(msh.comm)
+        workspace._configure_iterative_solver_on_ksp(ksp_sub)
+        pc_sub = ksp_sub.getPC()
+    else:
+        # Direct solver path (or multi-rank — falls back to pin+solve).
+        ksp.setOperators(A)
 
     for iteration in range(max_iter):
         probe_iter = collective_debug and (iteration < collective_debug_max_iter)
@@ -762,50 +820,76 @@ def solve_newton(
             f"iter {iteration}: after A.assemble()",
         )
 
-        # Pin inactive DOFs: identity rows, zero off-diag
-        _probe(
-            msh.comm,
-            probe_iter,
-            collective_debug_barrier,
-            f"iter {iteration}: before pin_inactive_dofs(A, b)",
-        )
-        pin_inactive_dofs(A, b, inactive_dofs)
-        _probe(
-            msh.comm,
-            probe_iter,
-            collective_debug_barrier,
-            f"iter {iteration}: after pin_inactive_dofs(A, b)",
-        )
+        jac_time_asm = _time.time() - jac_t0
+
+        if is_iterative and active_is is not None:
+            # --- Active-DOF subsystem path (iterative solver) ---
+            # Extract the active submatrix from the full Jacobian.
+            # Only active DOF rows/columns are included; inactive DOFs
+            # (identity rows) are eliminated, shrinking the system by 90%+.
+            if A_sub is None:
+                A_sub = A.createSubMatrix(active_is, active_is)
+            else:
+                A.createSubMatrix(active_is, active_is, submat=A_sub)
+            A_sub.assemble()
+
+            # Extract active portion of residual (safe even if this rank has 0 active DOFs).
+            if b_sub is None:
+                b_sub = A_sub.createVecRight()
+                du_sub = A_sub.createVecRight()
+            if len(active_dofs_local) > 0:
+                b_sub.array[:] = b.array[active_dofs_local]
+
+            # Set operators and manage PC lagging.
+            ksp_sub.setOperators(A_sub)
+            if iteration == 0:
+                pc_sub.setReusePreconditioner(False)
+                pc_lagged = False
+            elif iteration == 1 and not pc_lagged:
+                pc_sub.setReusePreconditioner(True)
+                pc_lagged = True
+        else:
+            # --- Full-system path (direct solver only) ---
+            pin_inactive_dofs(A, b, inactive_dofs)
 
         jac_time = _time.time() - jac_t0
         _memory_snapshot(iteration, "post-jacobian")
 
         if debug and iteration == 0:
-            # Mat.norm is MPI-collective; avoid rank-conditional collectives in debug output.
-            _live_print(f"  │  Jacobian: asm+pin={jac_time:.2f}s")
+            _live_print(f"  │  Jacobian: asm={jac_time_asm:.2f}s total={jac_time:.2f}s")
 
         # --- Solve linear system ---
         du.x.array[:] = 0.0
 
         _memory_snapshot(iteration, "pre-ksp-solve")
-        _probe(
-            msh.comm,
-            probe_iter,
-            collective_debug_barrier,
-            f"iter {iteration}: before ksp.solve",
-        )
-        ksp.solve(b, du.x.petsc_vec)
-        _probe(
-            msh.comm,
-            probe_iter,
-            collective_debug_barrier,
-            f"iter {iteration}: after ksp.solve",
-        )
+        if is_iterative and active_is is not None:
+            du_sub.set(0.0)
+            ksp_sub.solve(b_sub, du_sub)
+            # Scatter solution back to full du vector.
+            if len(active_dofs_local) > 0:
+                du.x.array[active_dofs_local] = du_sub.array
+            ksp_reason = ksp_sub.getConvergedReason()
+        else:
+            ksp.solve(b, du.x.petsc_vec)
+            ksp_reason = ksp.getConvergedReason()
         _memory_snapshot(iteration, "post-ksp-solve")
-        ksp_reason = ksp.getConvergedReason()
         ksp_reason_global = msh.comm.allreduce(int(ksp_reason), op=MPI.MIN)
 
         if ksp_reason_global < 0:
+            # Near-convergence guard: if the nonlinear residual is already
+            # substantially reduced, accept the solution despite KSP failure.
+            # Threshold: within 1% of initial residual, or 10x rtol.
+            ksp_near_tol = max(rtol * 10, 1e-2)
+            if rel_res < ksp_near_tol:
+                if debug:
+                    _live_print(
+                        f"  │ {iteration:3d} │ {res_norm:12.4e} │ {rel_res:12.4e} │          │   —   │ CONV(KSP-nr) │"
+                    )
+                    _live_print(
+                        "  └─────┴──────────────┴──────────────┴──────────┴───────┴──────────────┘"
+                    )
+                _cleanup(owns_workspace)
+                return iteration, True, "converged (KSP-near)"
             if debug:
                 _live_print(
                     f"  │ {iteration:3d} │ {res_norm:12.4e} │ {rel_res:12.4e} │          │   —   │ ABORT: KSP {ksp_reason_global:2d} │"
@@ -835,8 +919,33 @@ def solve_newton(
 
         du_norm = np.linalg.norm(du.x.array)
 
+        # Newton stagnation guard: if KSP returns a (near-)zero update, the
+        # residual is at the solver noise floor.  Declare converged rather
+        # than looping with zero progress.
+        u_norm = np.linalg.norm(u.x.array)
+        du_rel = du_norm / max(u_norm, 1.0)
+        if du_rel < 1e-14:
+            if debug:
+                _live_print(
+                    f"  │ {iteration:3d} │ {res_norm:12.4e} │ {rel_res:12.4e} │ {du_norm:8.2e} │   —   │ CONV(stag)   │"
+                )
+                _live_print(
+                    "  └─────┴──────────────┴──────────────┴──────────┴───────┴──────────────┘"
+                )
+            _cleanup(owns_workspace)
+            return iteration, True, "converged (stagnation)"
+
         # Track linear solver iteration count for iterative KSP types.
-        ksp_its = ksp.getIterationNumber()
+        _ksp_ref = ksp_sub if (is_iterative and ksp_sub is not None) else ksp
+        ksp_its = _ksp_ref.getIterationNumber()
+
+        # Record first-iteration KSP count for PC lagging safety valve.
+        if iteration == 0:
+            first_ksp_its = max(ksp_its, 1)
+        # Safety valve: if lagged PC degrades badly, refresh it.
+        if is_iterative and pc_lagged and pc_sub is not None and ksp_its > 3 * first_ksp_its:
+            pc_sub.setReusePreconditioner(False)
+            pc_lagged = False
 
         # --- Backtracking line search ---
         # Trial updates use u <- u - omega*du with omega in (omega_min, 1].

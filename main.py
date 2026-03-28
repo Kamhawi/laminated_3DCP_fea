@@ -293,6 +293,7 @@ def main():
             disp_path,
             cell_path,
             log_path,
+            interior_facet_tags=interior_facet_tags,
             simulation_start_time=simulation_start_time,
         )
 

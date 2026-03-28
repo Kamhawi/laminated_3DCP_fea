@@ -172,6 +172,7 @@ def run_simulation(
     disp_path,
     cell_path,
     log_path,
+    interior_facet_tags=None,
     simulation_start_time=None,
 ):
     """Execute the full transient simulation loop.
@@ -391,15 +392,70 @@ def run_simulation(
     eps_vp_size_local, eps_vp_size_global, eps_vp_global_indices = _field_checkpoint_layout(
         eps_vp
     )
+    damage_max_field = materials.damage_max
+    dmg_size_local, dmg_size_global, dmg_global_indices = _field_checkpoint_layout(
+        damage_max_field
+    )
+
+    # ------------------------------------------------------------------
+    # Precompute inter-layer facet data for damage_max update.
+    # ------------------------------------------------------------------
+    n_il = 0
+    il_cell_plus = np.empty(0, dtype=np.int32)
+    il_cell_minus = np.empty(0, dtype=np.int32)
+    il_facet_normals = np.empty((0, 3), dtype=np.float64)
+    il_h_cells = np.empty(0, dtype=np.float64)
+    if interior_facet_tags is not None:
+        _il_mask = interior_facet_tags.values == 1
+        _il_facet_indices = interior_facet_tags.indices[_il_mask]
+        n_il = len(_il_facet_indices)
+        if n_il > 0:
+            tdim = msh.topology.dim
+            fdim = tdim - 1
+            msh.topology.create_connectivity(fdim, tdim)
+            msh.topology.create_connectivity(fdim, 0)
+            _f_to_c = msh.topology.connectivity(fdim, tdim)
+            _f_to_v = msh.topology.connectivity(fdim, 0)
+            il_cell_plus = np.empty(n_il, dtype=np.int32)
+            il_cell_minus = np.empty(n_il, dtype=np.int32)
+            for _i, _f in enumerate(_il_facet_indices):
+                _cells = _f_to_c.links(_f)
+                il_cell_plus[_i] = _cells[0]
+                il_cell_minus[_i] = _cells[1] if len(_cells) > 1 else _cells[0]
+
+            # Compute per-facet unit normals from vertex coordinates.
+            from dolfinx.mesh import entities_to_geometry as _e2g
+            _geom_x = msh.geometry.x
+            il_facet_normals = np.empty((n_il, 3), dtype=np.float64)
+            for _i, _f in enumerate(_il_facet_indices):
+                _verts = _f_to_v.links(_f)
+                _geom_dofs = _e2g(
+                    msh, 0, _verts.astype(np.int32), False
+                ).reshape(-1)
+                _coords = _geom_x[_geom_dofs]
+                _normal = np.cross(_coords[1] - _coords[0], _coords[3] - _coords[0])
+                _norm = np.linalg.norm(_normal)
+                il_facet_normals[_i] = _normal / _norm if _norm > 1e-12 else _normal
+
+            # Precompute cell diameters.
+            from dolfinx.cpp.mesh import h as _dolfinx_h
+            _map_c = msh.topology.index_map(tdim)
+            _all_cells = np.arange(
+                _map_c.size_local + _map_c.num_ghosts, dtype=np.int32
+            )
+            il_h_cells = np.asarray(_dolfinx_h(msh._cpp_object, tdim, _all_cells))
 
     def save_checkpoint(step_idx, t_val):
         """Save a single rank-agnostic checkpoint file for the current step."""
         u_local_values = u.x.array[:u_size_local].copy()
         eps_vp_local_values = eps_vp.x.array[:eps_vp_size_local].copy()
+        dmg_local_values = damage_max_field.x.array[:dmg_size_local].copy()
         gathered_u_indices = comm.gather(u_global_indices, root=0)
         gathered_u_values = comm.gather(u_local_values, root=0)
         gathered_eps_indices = comm.gather(eps_vp_global_indices, root=0)
         gathered_eps_values = comm.gather(eps_vp_local_values, root=0)
+        gathered_dmg_indices = comm.gather(dmg_global_indices, root=0)
+        gathered_dmg_values = comm.gather(dmg_local_values, root=0)
 
         if comm.rank == 0:
             u_global = _assemble_global_from_owned_chunks(
@@ -414,8 +470,19 @@ def run_simulation(
                 eps_vp_size_global,
                 "eps_vp",
             )
+            dmg_global = _assemble_global_from_owned_chunks(
+                gathered_dmg_indices,
+                gathered_dmg_values,
+                dmg_size_global,
+                "damage_max",
+            )
             checkpoint_file = checkpoint_dir / latest_checkpoint_filename
-            np.savez(checkpoint_file, u=u_global, eps_vp=eps_vp_global)
+            np.savez(
+                checkpoint_file,
+                u=u_global,
+                eps_vp=eps_vp_global,
+                damage_max=dmg_global,
+            )
             write_checkpoint_metadata(
                 checkpoint_dir,
                 step_idx,
@@ -445,21 +512,33 @@ def run_simulation(
                     )
                 u_global = np.asarray(data["u"], dtype=u.x.array.dtype)
                 eps_vp_global = np.asarray(data["eps_vp"], dtype=eps_vp.x.array.dtype)
+                # Backwards compatibility: old checkpoints lack damage_max.
+                if "damage_max" in data:
+                    dmg_global = np.asarray(
+                        data["damage_max"], dtype=damage_max_field.x.array.dtype
+                    )
+                else:
+                    dmg_global = np.zeros(dmg_size_global, dtype=damage_max_field.x.array.dtype)
         else:
             u_global = np.empty(0, dtype=u.x.array.dtype)
             eps_vp_global = np.empty(0, dtype=eps_vp.x.array.dtype)
+            dmg_global = np.empty(0, dtype=damage_max_field.x.array.dtype)
 
         u_count = np.array([u_global.size], dtype=np.int64)
         eps_count = np.array([eps_vp_global.size], dtype=np.int64)
+        dmg_count = np.array([dmg_global.size], dtype=np.int64)
         comm.Bcast(u_count, root=0)
         comm.Bcast(eps_count, root=0)
+        comm.Bcast(dmg_count, root=0)
 
         if comm.rank != 0:
             u_global = np.empty(int(u_count[0]), dtype=u.x.array.dtype)
             eps_vp_global = np.empty(int(eps_count[0]), dtype=eps_vp.x.array.dtype)
+            dmg_global = np.empty(int(dmg_count[0]), dtype=damage_max_field.x.array.dtype)
 
         comm.Bcast(u_global, root=0)
         comm.Bcast(eps_vp_global, root=0)
+        comm.Bcast(dmg_global, root=0)
 
         if int(u_count[0]) != u_size_global:
             raise RuntimeError(
@@ -473,8 +552,11 @@ def run_simulation(
 
         u.x.array[:u_size_local] = u_global[u_global_indices]
         eps_vp.x.array[:eps_vp_size_local] = eps_vp_global[eps_vp_global_indices]
+        if int(dmg_count[0]) == dmg_size_global:
+            damage_max_field.x.array[:dmg_size_local] = dmg_global[dmg_global_indices]
         u.x.scatter_forward()
         eps_vp.x.scatter_forward()
+        damage_max_field.x.scatter_forward()
 
     n_steps = time_cfg["n_steps"]
     local_birth_owned = birth_times_dolfinx[:num_owned_cells]
@@ -491,6 +573,9 @@ def run_simulation(
         global_t_max * time_cfg["end_multiplier"],
         n_steps,
     )
+    max_steps = int(time_cfg.get("max_steps", 0))
+    if max_steps > 0:
+        full_times = full_times[:max_steps]
     times = full_times.copy()
     start_idx = 0
     resume_step = None
@@ -565,8 +650,6 @@ def run_simulation(
     )
 
     total_newton_iters = 0
-    total_newton_fallback_attempts = 0
-    total_newton_fallback_recoveries = 0
     total_perzyna_steps = 0
     total_time_newton = 0.0
     total_time_perzyna = 0.0
@@ -622,14 +705,6 @@ def run_simulation(
         return
 
     newton_workspace = NewtonLinearWorkspace(V, msh, F_form, solver_cfg=solver_cfg)
-    fallback_workspace = None
-    use_direct_fallback = (
-        newton_workspace.linear_solver_mode == "iterative_with_direct_fallback"
-    )
-    fallback_solver_cfg = None
-    if use_direct_fallback:
-        fallback_solver_cfg = dict(solver_cfg)
-        fallback_solver_cfg["linear_solver"] = "direct"
 
     track_mumps_memory_primary = (
         newton_memory_track_mumps
@@ -647,10 +722,7 @@ def run_simulation(
         log_message(
             f"  Linear solver mode: {newton_workspace.linear_solver_mode}"
         )
-        if newton_workspace.linear_solver_mode in {
-            "iterative",
-            "iterative_with_direct_fallback",
-        }:
+        if newton_workspace.linear_solver_mode == "iterative":
             iterative_cfg = solver_cfg.get("iterative", {})
             ksp_type = iterative_cfg.get(
                 "ksp_type",
@@ -677,10 +749,6 @@ def run_simulation(
                     f"  Iterative KSP/PC: {ksp_type}/{pc_type}"
                     f" (restart={gmres_restart})"
                 )
-            if use_direct_fallback:
-                log_message(
-                    "  Fallback mode: direct MUMPS retry enabled for iterative linear failures"
-                )
         if collective_debug:
             log_message(
                 "  DEBUG: collective probes enabled "
@@ -700,13 +768,9 @@ def run_simulation(
             )
             if track_mumps_memory_primary:
                 log_message("  DEBUG: Newton memory tracker includes MUMPS INFOG stats")
-            elif newton_memory_track_mumps and (not use_direct_fallback):
+            elif newton_memory_track_mumps:
                 log_message(
                     "  DEBUG: MUMPS INFOG tracking skipped (linear solver is iterative)"
-                )
-            elif newton_memory_track_mumps and use_direct_fallback:
-                log_message(
-                    "  DEBUG: MUMPS INFOG tracking enabled for direct fallback retries"
                 )
 
     newton_workspace.ensure_jacobian(J_form)
@@ -734,6 +798,7 @@ def run_simulation(
                 materials.strain,
                 materials.stress,
                 materials.eps_vp,
+                materials.damage_max,
             ],
         ) as vtx_cell:
             t_prev = float(resume_time) if checkpoint_resume_enabled else (times[0] - dt_default)
@@ -765,16 +830,28 @@ def run_simulation(
                         newly_active_cells,
                         support,
                         cell_to_dofs,
+                        birth_times=birth_times_dolfinx,
+                        t_prev=t_prev,
                     )
                     step_probe(step, "after init_newly_activated_displacement")
+                    if newly_active_cells.size > 0 and comm.rank == 0:
+                        _new_dofs = cell_to_dofs[newly_active_cells].reshape(-1)
+                        _u_new = u.x.array[_new_dofs]
+                        log_message(
+                            f"  Init disp: {len(newly_active_cells)} new cells, "
+                            f"max|u|={np.max(np.abs(_u_new)):.4e}, "
+                            f"mean|u|={np.mean(np.abs(_u_new)):.4e}"
+                        )
                     newly_active_mask = np.zeros_like(birth_times_dolfinx, dtype=bool)
                     newly_active_mask[newly_active_cells] = True
                     if np.any(newly_active_mask):
                         eps_vp_arr = materials.eps_vp.x.array.reshape((-1, 3, 3))
                         eps_vp_arr[newly_active_mask, :, :] = 0.0
+                        materials.damage_max.x.array[newly_active_mask] = 0.0
                     # Must be called on all ranks to avoid rank-divergent ghost updates.
                     step_probe(step, "before eps_vp.scatter_forward")
                     materials.eps_vp.x.scatter_forward()
+                    materials.damage_max.x.scatter_forward()
                     step_probe(step, "after eps_vp.scatter_forward")
 
                 t0 = time.time()
@@ -824,64 +901,6 @@ def run_simulation(
                     memory_tracking_collect_garbage=newton_memory_collect_garbage,
                     memory_tracking_mumps=track_mumps_memory_primary,
                 )
-                fallback_triggered = False
-                fallback_reason = (
-                    msg.startswith("KSP diverged")
-                    or msg == "non-finite linear solution"
-                )
-                if (not converged) and use_direct_fallback and fallback_reason:
-                    fallback_triggered = True
-                    total_newton_fallback_attempts += 1
-                    if comm.rank == 0:
-                        log_message(
-                            "  Fallback: iterative linear solve failed, retrying with direct MUMPS"
-                        )
-                    u.x.array[:] = u_backup
-                    u.x.scatter_forward()
-
-                    if fallback_workspace is None:
-                        fallback_workspace = NewtonLinearWorkspace(
-                            V,
-                            msh,
-                            F_form,
-                            solver_cfg=fallback_solver_cfg,
-                        )
-                        fallback_workspace.ensure_jacobian(J_form)
-                        if comm.rank == 0 and newton_memory_debug:
-                            log_message(
-                                "  DEBUG: direct fallback workspace preallocated and ready"
-                            )
-
-                    n_iter_fb, converged_fb, msg_fb = solve_newton(
-                        u,
-                        V,
-                        msh,
-                        F_form,
-                        J_form,
-                        t_val=t_val,
-                        birth_times=birth_times_dolfinx,
-                        cell_to_dofs=cell_to_dofs,
-                        max_iter=solver_cfg["max_iterations"],
-                        rtol=solver_cfg["rtol"],
-                        atol=solver_cfg["atol"],
-                        debug=(comm.rank == 0),
-                        collective_debug=collective_debug,
-                        collective_debug_max_iter=collective_debug_max_iter,
-                        collective_debug_barrier=collective_debug_barrier,
-                        workspace=fallback_workspace,
-                        memory_tracking=newton_memory_debug,
-                        memory_tracking_every_iter=newton_memory_every_iter,
-                        memory_tracking_collect_garbage=newton_memory_collect_garbage,
-                        memory_tracking_mumps=newton_memory_track_mumps,
-                    )
-                    n_iter = int(n_iter) + int(n_iter_fb)
-                    converged = bool(converged_fb)
-                    msg = (
-                        f"{msg}; direct fallback -> {msg_fb}"
-                        if not converged_fb
-                        else f"{msg_fb} (recovered via direct fallback)"
-                    )
-
                 time_newton = time.time() - t_newton_start
 
                 if not converged:
@@ -889,10 +908,6 @@ def run_simulation(
                         log_message("  REVERTING: restoring displacement from before failed step")
                     u.x.array[:] = u_backup
                     u.x.scatter_forward()
-                elif fallback_triggered and comm.rank == 0:
-                    log_message("  Fallback: direct solve recovered this step")
-                if fallback_triggered and converged:
-                    total_newton_fallback_recoveries += 1
 
                 zero_inactive_cells(u, t_val, birth_times_dolfinx, cell_to_dofs)
                 update_active_indicator(is_active_func, t_val, birth_times_dolfinx)
@@ -1044,6 +1059,15 @@ def run_simulation(
                 materials.max_principal_stress.x.scatter_forward()
                 materials.yield_function_trial.x.scatter_forward()
 
+                # Update damage_max history on inter-layer facets.
+                if n_il > 0:
+                    from materials.damage_update import update_damage_max_numpy
+                    update_damage_max_numpy(
+                        u, materials, cell_to_dofs, birth_times_dolfinx,
+                        cfg, il_cell_plus, il_cell_minus,
+                        il_facet_normals, il_h_cells, active_mask,
+                    )
+
                 # u.x.array is interleaved vector storage [ux0, uy0, uz0, ux1, ...].
                 # Reshape to (n_nodes_local, 3) to compute vector magnitudes.
                 u_vec = u.x.array.reshape((-1, 3))
@@ -1193,12 +1217,6 @@ def run_simulation(
                 log_message("  Computational Effort:")
                 log_message(f"    Total Time Steps:    {n_steps}")
                 log_message(f"    Total Newton Iters:  {total_newton_iters}")
-                if use_direct_fallback:
-                    log_message(
-                        "    Newton Fallbacks:   "
-                        f"{total_newton_fallback_attempts} attempts, "
-                        f"{total_newton_fallback_recoveries} recovered"
-                    )
                 log_message(f"    Total Perzyna Steps: {total_perzyna_steps}")
                 log_message("  ")
                 log_message("  Timing Breakdown:")
@@ -1214,8 +1232,6 @@ def run_simulation(
     finally:
         if newton_workspace is not None:
             newton_workspace.destroy()
-        if fallback_workspace is not None:
-            fallback_workspace.destroy()
         A_proj.destroy()
         b_strain.destroy()
         inv_diag_proj.destroy()

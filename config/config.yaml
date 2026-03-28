@@ -55,7 +55,7 @@ interface:
   eta_BK: 1.5                   # Benzeggagh-Kenane exponent [-]
   nozzle_pressure: 70000.0      # Nozzle deposition pressure [Pa]
   residual_stiffness_ratio: 0.05
-  K_min_mult: 0.1               # Lower bound multiplier for cohesive stiffness: K_min = K_min_mult * E/h
+  K_min_mult: 0.001              # Lower bound multiplier for cohesive stiffness: K_min = K_min_mult * E/h
 
 # -----------------------------------------------------------------------------
 # Activation Parameters
@@ -78,24 +78,24 @@ solver:
   max_iterations: 1000   # Maximum Newton iterations per step
   rtol: 1.0e-6          # Relative tolerance
   atol: 1.0e-10         # Absolute tolerance
-  linear_solver: direct   # direct | iterative | iterative_with_direct_fallback
+  linear_solver: iterative    # direct | iterative
   direct:
     mumps_icntl_14: 200   # MUMPS extra workspace percentage
+    out_of_core: false    # MUMPS OOC: pages factorization to disk (trades speed for memory)
   iterative:
-    ksp_type: gmres       # PETSc KSP type (e.g., gmres, bicgstab)
-    pc_type: bjacobi      # Block Jacobi: each MPI rank factors its local block
-    sub_pc_type: ilu      # Sub-preconditioner per block (ilu is standard for DG)
-    ilu_levels: 0         # ILU fill level: 0=cheapest, 1-2=better quality
-    rtol: 1.0e-8          # Linear solve relative tolerance
-    atol: 1.0e-12         # Linear solve absolute tolerance
-    max_it: 500           # Linear solve max iterations
-    gmres_restart: 200    # GMRES restart depth (must exceed expected iteration count)
+    ksp_type: preonly      # Direct solve on active-DOF subsystem
+    pc_type: lu           # Exact LU factorization of active subsystem (~1K-22K DOFs)
+    rtol: 1.0e-4          # (unused with preonly)
+    atol: 0               # (unused with preonly)
+    max_it: 500           # (unused with preonly)
+    gmres_restart: 100    # (unused with preonly)
 
 # -----------------------------------------------------------------------------
 # Time Stepping
 # -----------------------------------------------------------------------------
 time_stepping:
   n_steps: 300       # Number of time steps
+  max_steps: 25      # Stop after this many steps (0 = run all). For benchmarking.
   start_offset: 0.1     # Offset from minimum birth time [s]
   end_multiplier: 1.05  # Multiplier for maximum birth time
 
@@ -126,7 +126,7 @@ debug:
   output_io: false                # Probe enter/exit around VTX output writes
   step_setup: false             # Probe rank progress in pre-solver step setup
   step_setup_max_steps: 3       # Only print setup probes for first N steps
-  newton_memory_tracking: true    # Print Newton memory table each tracked iter
+  newton_memory_tracking: false   # Disabled for multi-rank benchmarks (collectives can stall)
   newton_memory_every_iter: 1     # Emit memory line every N Newton iterations
   newton_memory_collect_garbage: false  # Run Python GC before memory snapshots
   newton_memory_track_mumps: false  # Include MUMPS INFOG(16/26/29) stats (direct solver only)

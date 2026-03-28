@@ -147,13 +147,15 @@ def zero_newly_activated_cells(u, t_val, t_prev, birth_times, cell_to_dofs):
     u.x.scatter_forward()
 
 
-def init_newly_activated_displacement(u, newly_active_cells, support, cell_to_dofs):
-    """Initialize new cells using support-cell rigid translation inheritance.
+def init_newly_activated_displacement(
+    u, newly_active_cells, support, cell_to_dofs, birth_times=None, t_prev=None
+):
+    """Initialize new cells by copying full DOF state from support cell.
 
-    For each newly active cell with a valid support cell, the routine computes
-    the mean support displacement components ``(tx, ty, tz)`` and assigns those
-    means to all DOFs of the new cell. Cells without support are initialized to
-    zero.
+    For each newly active cell with a valid support cell that was already
+    active at ``t_prev``, the routine copies all displacement DOFs from the
+    support cell. Cells whose support cell is not yet active (or has no
+    support) are initialized to zero.
 
     Args:
         u: Displacement function updated in place.
@@ -162,6 +164,10 @@ def init_newly_activated_displacement(u, newly_active_cells, support, cell_to_do
             index or ``-1`` when unavailable. May be ``None``.
         cell_to_dofs: Cell-to-vector-DOF map with shape
             ``(num_cells, dofs_per_cell)``.
+        birth_times: Cell birth-time array. When provided with ``t_prev``,
+            only copies from support cells that were active at ``t_prev``.
+        t_prev: Previous step time. Support cells with ``birth_time > t_prev``
+            are treated as inactive (u=0) and skipped.
 
     Returns:
         None.
@@ -170,8 +176,8 @@ def init_newly_activated_displacement(u, newly_active_cells, support, cell_to_do
         None.
 
     Physics:
-        The initialization approximates rigid body inheritance from underlying
-        support material at activation time, reducing artificial transients.
+        The initialization copies the full deformation state from the underlying
+        support cell at activation time, reducing artificial transients.
     """
     cells = np.asarray(newly_active_cells, dtype=np.int64)
     if cells.size == 0:
@@ -189,27 +195,27 @@ def init_newly_activated_displacement(u, newly_active_cells, support, cell_to_do
 
     # Split new cells by support availability to avoid branchy per-cell loops.
     has_support = support[cells] >= 0
+
+    # Additionally check that the support cell is already active (was born
+    # before the current step). Inactive support cells have u=0, so copying
+    # from them is useless.
+    if has_support.any() and birth_times is not None and t_prev is not None:
+        support_ids = support[cells[has_support]]
+        support_active = birth_times[support_ids] <= t_prev
+        # Demote cells whose support is not yet active to unsupported.
+        active_idx = np.where(has_support)[0]
+        has_support[active_idx[~support_active]] = False
+
     supported_cells = cells[has_support]
     unsupported_cells = cells[~has_support]
 
     if supported_cells.size > 0:
         support_cells = support[supported_cells].astype(np.int64, copy=False)
         support_dofs = cell_to_dofs[support_cells]
-        support_u = u.x.array[support_dofs]
-
-        # Vector DOFs are interleaved [ux, uy, uz, ux, uy, uz, ...].
-        # Slicing with step=3 isolates each Cartesian component so the mean
-        # rigid translation can be computed independently per support cell.
-        tx = support_u[:, 0::3].mean(axis=1)
-        ty = support_u[:, 1::3].mean(axis=1)
-        tz = support_u[:, 2::3].mean(axis=1)
-
         new_dofs = cell_to_dofs[supported_cells]
-        # Broadcast each scalar component mean to all same-component DOFs in
-        # the target cell, preserving interleaved vector layout.
-        u.x.array[new_dofs[:, 0::3]] = tx[:, None]
-        u.x.array[new_dofs[:, 1::3]] = ty[:, None]
-        u.x.array[new_dofs[:, 2::3]] = tz[:, None]
+        # Full DOF copy: newly activated cells inherit the complete deformed
+        # shape from the support cell below, preserving internal strain.
+        u.x.array[new_dofs] = u.x.array[support_dofs]
 
     if unsupported_cells.size > 0:
         # Unsupported new cells remain zero-initialized by design.

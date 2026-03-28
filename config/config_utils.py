@@ -150,5 +150,8 @@ def get_checkpoint_dir(cfg: Dict[str, Any]) -> Path:
     checkpoint_cfg = cfg.get("checkpoint", {})
     checkpoint_dir_cfg = checkpoint_cfg.get("directory", "checkpoints")
     checkpoint_dir = _resolve_relative_to(project_root, checkpoint_dir_cfg)
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        pass  # Race condition with MPI ranks or macOS xattr quirk
     return checkpoint_dir

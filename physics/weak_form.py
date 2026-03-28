@@ -29,6 +29,8 @@ def build_evp_cohesive_weak_form(
     interior_facet_tags,
     dirichlet_tags,
     cfg,
+    return_ufl=False,
+    alpha_facet_mode="min",
 ):
     """Build and compile nonlinear residual/Jacobian for the simulation.
 
@@ -42,7 +44,9 @@ def build_evp_cohesive_weak_form(
         cfg: Parsed configuration dictionary.
 
     Returns:
-        tuple: ``(F_form, J_form)`` compiled DOLFINx forms.
+        tuple: ``(F_form, J_form)`` compiled DOLFINx forms.  When
+            ``return_ufl=True``, returns ``(F_form, J_form, F_ufl, J_ufl)``
+            with the pre-compilation UFL expressions for diagnostic use.
 
     Raises:
         ValueError: If ``materials.u`` has not been assigned before form build.
@@ -87,7 +91,16 @@ def build_evp_cohesive_weak_form(
     alpha_min = activation_cfg["alpha_min"]
     alpha_raw = 0.5 * (1.0 + ufl.tanh(sharpness * (materials.t_current - birth_time_func)))
     alpha = alpha_min + (1.0 - alpha_min) * alpha_raw
-    alpha_facet = ufl.min_value(alpha("+"), alpha("-"))
+    if alpha_facet_mode == "min":
+        alpha_facet = ufl.min_value(alpha("+"), alpha("-"))
+    elif alpha_facet_mode == "max":
+        alpha_facet = ufl.max_value(alpha("+"), alpha("-"))
+    elif alpha_facet_mode == "avg":
+        alpha_facet = 0.5 * (alpha("+") + alpha("-"))
+    else:
+        raise ValueError(f"Unknown alpha_facet_mode: {alpha_facet_mode!r}")
+    # Cohesive interfaces use max: couple at the mature side's strength
+    alpha_facet_cohesive = ufl.max_value(alpha("+"), alpha("-"))
 
     # ``ufl.jump(u)`` is the displacement discontinuity across an interior
     # facet. It drives cohesive opening/sliding laws on dS(1).
@@ -136,6 +149,8 @@ def build_evp_cohesive_weak_form(
     )
     damage = 1.0 - ufl.exp(-(damage_arg_n + damage_arg_t))
     damage = ufl.min_value(1.0, ufl.max_value(damage, 0.0))
+    # Enforce damage irreversibility via per-cell history variable.
+    damage = ufl.max_value(damage, ufl.max_value(materials.damage_max("+"), materials.damage_max("-")))
 
     K_n_res = residual_stiffness_ratio * K_n
     K_t_res = residual_stiffness_ratio * K_t
@@ -159,14 +174,15 @@ def build_evp_cohesive_weak_form(
     # - body force loading.
     F = alpha * ufl.inner(sigma_u, epsilon(v)) * dx
     # Cohesive traction virtual work on inter-layer facets.
-    F += ufl.inner(alpha_facet * T_cohesive, ufl.jump(v)) * dS(1)
+    F += ufl.inner(alpha_facet_cohesive * T_cohesive, ufl.jump(v)) * dS(1)
     # Intra-layer bonded interfaces: consistent + symmetric SIP couplings.
     F += -ufl.inner(alpha_facet * ufl.avg(sigma_u) * n("+"), ufl.jump(v)) * dS(2)
     F += -ufl.inner(alpha_facet * ufl.avg(sigma(v, lam, mu)) * n("+"), ufl.jump(u)) * dS(2)
     F += alpha_facet * gamma_bonded * ufl.inner(ufl.jump(u), ufl.jump(v)) * dS(2)
-    # Global jump stabilization on all interior tags (0/1/2) for robustness.
+    # Jump stabilization on non-cohesive interior facets only.
+    # dS(1) excluded: cohesive law (K_n, K_t) provides interface coupling there.
     gamma_safe = 0.05 * ufl.avg(materials.E) / h
-    F += gamma_safe * ufl.inner(ufl.jump(u), ufl.jump(v)) * (dS(0) + dS(1) + dS(2))
+    F += alpha_facet * gamma_safe * ufl.inner(ufl.jump(u), ufl.jump(v)) * (dS(0) + dS(2))
     # Weak Dirichlet (Nitsche-like) boundary terms on ds(1).
     F += -alpha * ufl.inner(sigma_u * n, v) * ds(1)
     F += -alpha * ufl.inner(sigma(v, lam, mu) * n, u) * ds(1)
@@ -175,4 +191,6 @@ def build_evp_cohesive_weak_form(
     F += -alpha * ufl.inner(g_vec, v) * dx
 
     J = ufl.derivative(F, u, ufl.TrialFunction(V))
+    if return_ufl:
+        return fem.form(F), fem.form(J), F, J
     return fem.form(F), fem.form(J)
