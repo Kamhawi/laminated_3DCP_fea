@@ -66,21 +66,11 @@ class NewtonLinearWorkspace:
         return aliases[mode_str]
 
     def _configure_linear_solver(self):
-        """Configure linear solver backend selected in ``solver_cfg``."""
-        if self.linear_solver_mode == "direct":
+        """Configure workspace KSP based on linear_solver_mode."""
+        if self.linear_solver_mode == "iterative":
+            self._configure_iterative_solver()
+        else:
             self._configure_direct_solver()
-            return
-        self._configure_iterative_solver()
-
-    def _configure_iterative_solver_on_ksp(self, target_ksp):
-        """Apply iterative solver config to an external KSP (for subsystem solves)."""
-        # Temporarily swap self.ksp, configure, then restore.
-        orig_ksp = self.ksp
-        orig_pc = self.pc
-        self.ksp = target_ksp
-        self._configure_iterative_solver()
-        self.ksp = orig_ksp
-        self.pc = orig_pc
 
     def ensure_jacobian(self, J_form):
         """Allocate Jacobian once so sparsity is reused across all steps."""
@@ -125,14 +115,11 @@ class NewtonLinearWorkspace:
         self._factor_mat = None
 
     def _configure_iterative_solver(self):
-        """Configure KSP/PC for iterative solves on the active-DOF subsystem.
+        """Configure workspace KSP/PC for iterative full-system solve.
 
-        The default configuration uses ``preonly`` + ``lu``: a direct solve
-        on the extracted active-DOF subsystem (typically 1K-22K DOFs instead
-        of the full 432K).  On multi-rank, MUMPS is used for distributed LU.
-
-        Alternative PC types (hypre, bjacobi, asm) are supported via config
-        for experimentation.
+        The workspace KSP is used directly on the full pinned system
+        (inactive DOFs set to identity rows via ``pin_inactive_dofs``).
+        All PETSc objects persist across time steps — no per-step allocation.
         """
         iterative_cfg = self.solver_cfg.get("iterative", {})
         ksp_type = str(
@@ -195,17 +182,17 @@ class NewtonLinearWorkspace:
             opts.setValue("-pc_hypre_boomeramg_interp_type", "ext+i")
             opts.setValue("-pc_hypre_boomeramg_agg_nl", "2")
         elif pc_type == "bjacobi":
-            # Cell-level block Jacobi: DG DOFs are contiguous per cell,
-            # so n_blocks = n_cells gives one 24×24 block per cell.
-            sub_pc_type = str(iterative_cfg.get("sub_pc_type", "lu")).strip().lower()
-            map_c = self.msh.topology.index_map(self.msh.topology.dim)
-            n_cells = map_c.size_local + map_c.num_ghosts
-            opts.setValue("-pc_bjacobi_blocks", str(n_cells))
+            # Rank-level block Jacobi: one ILU(0) block per MPI rank.
+            # Each rank factorizes its full local matrix (~36k rows).
+            # After inactive-DOF pinning, identity rows factorize trivially.
+            sub_pc_type = str(iterative_cfg.get("sub_pc_type", "ilu")).strip().lower()
+            ilu_levels = int(iterative_cfg.get("ilu_levels", 0))
             opts.setValue("-sub_ksp_type", "preonly")
             opts.setValue("-sub_pc_type", sub_pc_type)
-            if sub_pc_type == "lu":
-                opts.setValue("-sub_pc_factor_shift_type", "nonzero")
-                opts.setValue("-sub_pc_factor_shift_amount", "1e-10")
+            if sub_pc_type == "ilu" and ilu_levels >= 0:
+                opts.setValue("-sub_pc_factor_levels", str(ilu_levels))
+            opts.setValue("-sub_pc_factor_shift_type", "nonzero")
+            opts.setValue("-sub_pc_factor_shift_amount", "1e-4")
         elif pc_type == "asm":
             sub_pc_type = str(iterative_cfg.get("sub_pc_type", "ilu")).strip().lower()
             ilu_levels = int(iterative_cfg.get("ilu_levels", 0))
@@ -312,6 +299,33 @@ def _probe(comm, enabled, barrier, label):
     print(f"[DBG][rank {comm.rank}] {label}", flush=True)
     if barrier:
         comm.Barrier()
+
+
+def _mem_trace(comm, label, debug_flag, _state={}):
+    """Print per-operation RSS delta. All ranks must call (uses allreduce)."""
+    rss = _current_rss_bytes()
+    rss_max = comm.allreduce(rss, op=MPI.MAX)
+    prev = _state.get("prev", rss_max)
+    delta = rss_max - prev
+    _state["prev"] = rss_max
+    if debug_flag and comm.rank == 0 and abs(delta) > 1024 * 1024:  # >1 MB change
+        _live_print(
+            f"  [MTRACE] {label:30s}"
+            f"  rss_max={_bytes_to_gib(rss_max):.3f}G"
+            f"  delta={delta / 1024**2:+.1f}MB"
+        )
+
+
+def _rank_report(comm, label, local_data, debug_flag):
+    """Collect per-rank diagnostics to rank 0 and print summary.
+
+    All ranks MUST call this (MPI collective via gather).
+    Only rank 0 prints when debug_flag is True.
+    """
+    all_data = comm.gather(local_data, root=0)
+    if debug_flag and comm.rank == 0:
+        for rank_id, data in enumerate(all_data):
+            _live_print(f"  │  [{label}] rank {rank_id}: {data}")
 
 
 def _live_print(msg):
@@ -489,8 +503,18 @@ def solve_newton(
         memory_tracking_mumps: Include MUMPS INFOG memory metrics in tracker.
 
     Returns:
-        tuple[int, bool, str]:
-            ``(n_iter, converged, message)``.
+        tuple[int, bool, str, dict]:
+            ``(n_iter, converged, message, stats)`` where *stats* is a
+            dictionary with additional solver diagnostics::
+
+                res0          – initial residual norm ||R0||
+                res_final     – final residual norm ||R||
+                rel_res_final – final ||R||/||R0||
+                total_ksp_its – cumulative linear-solver iterations
+                total_ls_its  – cumulative line-search back-tracks
+                final_omega   – step length at the last Newton iteration
+                n_active_dofs – globally active (non-pinned) DOFs
+                n_inactive_dofs – globally pinned DOFs
 
     Raises:
         None.
@@ -526,6 +550,7 @@ def solve_newton(
     n_active_local = n_total_local - n_inactive_local
 
     # Calculate GLOBAL counts across all MPI ranks
+    n_ranks = msh.comm.size
     n_inactive = msh.comm.allreduce(n_inactive_local, op=MPI.SUM)
     n_total = msh.comm.allreduce(n_total_local, op=MPI.SUM)
     n_active = msh.comm.allreduce(n_active_local, op=MPI.SUM)
@@ -534,6 +559,18 @@ def solve_newton(
         _live_print(
             f"  DOFs: {n_active} active / {n_inactive} pinned / {n_total} total (global)"
         )
+    if n_ranks > 1:
+        rank_dofs = msh.comm.gather(
+            (msh.comm.rank, n_active_local, n_inactive_local, n_total_local),
+            root=0,
+        )
+        if debug and rank_dofs is not None:
+            for r, na, ni, nt in rank_dofs:
+                _live_print(
+                    f"  DOFs (rank {r}): {na} active"
+                    f" / {ni} pinned / {nt} total"
+                )
+    if debug:
         _live_print(
             "  ┌─────┬──────────────┬──────────────┬──────────┬───────┬──────────────┐"
         )
@@ -547,6 +584,21 @@ def solve_newton(
     res_norm_0 = None
     res_norm = np.nan
     rel_res = np.nan
+    total_ksp_its = 0
+    total_ls_its = 0
+    last_omega = 1.0
+
+    def _build_stats():
+        return {
+            "res0": float(res_norm_0) if res_norm_0 is not None else float("nan"),
+            "res_final": float(res_norm),
+            "rel_res_final": float(rel_res),
+            "total_ksp_its": total_ksp_its,
+            "total_ls_its": total_ls_its,
+            "final_omega": last_omega,
+            "n_active_dofs": n_active,
+            "n_inactive_dofs": n_inactive,
+        }
 
     # Reuse solver and Jacobian structure when workspace is persistent.
     ksp = workspace.ksp
@@ -645,27 +697,9 @@ def solve_newton(
                 )
 
     def _cleanup(destroy_workspace):
-        nonlocal A_sub, b_sub, du_sub, active_is, ksp_sub, pc_sub
         _memory_snapshot(-1, "cleanup-pre")
         workspace.A = A
         workspace.assemble_mode = assemble_mode
-        # Destroy subsystem objects.
-        if A_sub is not None:
-            A_sub.destroy()
-            A_sub = None
-        if b_sub is not None:
-            b_sub.destroy()
-            b_sub = None
-        if du_sub is not None:
-            du_sub.destroy()
-            du_sub = None
-        if active_is is not None:
-            active_is.destroy()
-            active_is = None
-        if ksp_sub is not None:
-            ksp_sub.destroy()
-            ksp_sub = None
-            pc_sub = None
         if destroy_workspace:
             workspace.destroy()
             workspace.A = None
@@ -676,38 +710,42 @@ def solve_newton(
             gc.collect()
         _memory_snapshot(-1, "cleanup-post")
 
-    # Solver path selection:
-    # - 1 rank + iterative: subsystem extraction + LU on active DOFs only
-    # - direct: pin inactive DOFs + MUMPS on full system (unchanged)
+        # Per-step RSS summary (always emitted, regardless of memory_tracking).
+        # Force garbage collection to measure true retained memory.
+        gc.collect()
+        try:
+            PETSc.garbage_cleanup(msh.comm)
+        except Exception:
+            pass
+        # On Linux, ask glibc to return freed pages to the OS.
+        if sys.platform.startswith("linux"):
+            try:
+                import ctypes as _ctypes
+                _ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
+        rss_local = _current_rss_bytes()
+        rss_max_step = msh.comm.allreduce(rss_local, op=MPI.MAX)
+        if debug:
+            _live_print(
+                f"  RSS after cleanup+gc: {_bytes_to_gib(rss_max_step):.3f} GiB"
+                f" (peak: {_bytes_to_gib(_peak_rss_bytes()):.3f} GiB)"
+            )
+
+    # Both iterative and direct modes solve on the full pinned system.
+    # Inactive DOFs are pinned to identity rows each Newton iteration.
     is_iterative = workspace.linear_solver_mode == "iterative"
-    n_ranks = msh.comm.size
-    use_subsystem = is_iterative and n_ranks == 1 and n_active_local > 0
-    A_sub = None
-    b_sub = None
-    du_sub = None
-    active_is = None
-    active_dofs_local = None
-    ksp_sub = None
-    pc_sub = None
     first_ksp_its = 0
     pc_lagged = False
-
-    if use_subsystem:
-        # Single-rank fast path: extract active-DOF subsystem.
-        active_dofs_local = np.setdiff1d(
-            np.arange(num_owned_dofs, dtype=np.int32), inactive_dofs
-        )
-        active_is = PETSc.IS().createGeneral(active_dofs_local, comm=PETSc.COMM_SELF)
-        ksp_sub = PETSc.KSP().create(msh.comm)
-        workspace._configure_iterative_solver_on_ksp(ksp_sub)
-        pc_sub = ksp_sub.getPC()
-    else:
-        # Direct solver path (or multi-rank — falls back to pin+solve).
-        ksp.setOperators(A)
+    ksp.setOperators(A)
 
     for iteration in range(max_iter):
         probe_iter = collective_debug and (iteration < collective_debug_max_iter)
         _memory_snapshot(iteration, "iter-start")
+
+        _do_trace = (iteration == 0)
+        if _do_trace:
+            _mem_trace(msh.comm, "iter-start", debug)
 
         # --- Assemble residual ---
         with b.localForm() as b_local:
@@ -719,6 +757,8 @@ def solve_newton(
             f"iter {iteration}: before assemble_vector(residual)",
         )
         assemble_vector(b, F_form)
+        if _do_trace:
+            _mem_trace(msh.comm, "after assemble_vector(F)", debug)
         _probe(
             msh.comm,
             probe_iter,
@@ -761,7 +801,7 @@ def solve_newton(
                     "  └─────┴──────────────┴──────────────┴──────────┴───────┴──────────────┘"
                 )
             _cleanup(owns_workspace)
-            return iteration, False, "non-finite residual"
+            return iteration, False, "non-finite residual", _build_stats()
 
         if iteration == 0:
             res_norm_0 = res_norm if res_norm > 1e-14 else 1.0
@@ -777,7 +817,7 @@ def solve_newton(
                     "  └─────┴──────────────┴──────────────┴──────────┴───────┴──────────────┘"
                 )
             _cleanup(owns_workspace)
-            return iteration, True, "converged"
+            return iteration, True, "converged", _build_stats()
 
         # --- Assemble Jacobian ---
         jac_t0 = _time.time()
@@ -813,6 +853,8 @@ def solve_newton(
             f"iter {iteration}: before A.assemble()",
         )
         A.assemble()
+        if _do_trace:
+            _mem_trace(msh.comm, "after A.assemble()", debug)
         _probe(
             msh.comm,
             probe_iter,
@@ -822,35 +864,18 @@ def solve_newton(
 
         jac_time_asm = _time.time() - jac_t0
 
-        if is_iterative and active_is is not None:
-            # --- Active-DOF subsystem path (iterative solver) ---
-            # Extract the active submatrix from the full Jacobian.
-            # Only active DOF rows/columns are included; inactive DOFs
-            # (identity rows) are eliminated, shrinking the system by 90%+.
-            if A_sub is None:
-                A_sub = A.createSubMatrix(active_is, active_is)
-            else:
-                A.createSubMatrix(active_is, active_is, submat=A_sub)
-            A_sub.assemble()
+        # Pin inactive DOFs to identity rows in both iterative and direct modes.
+        pin_inactive_dofs(A, b, inactive_dofs)
 
-            # Extract active portion of residual (safe even if this rank has 0 active DOFs).
-            if b_sub is None:
-                b_sub = A_sub.createVecRight()
-                du_sub = A_sub.createVecRight()
-            if len(active_dofs_local) > 0:
-                b_sub.array[:] = b.array[active_dofs_local]
-
-            # Set operators and manage PC lagging.
-            ksp_sub.setOperators(A_sub)
+        # PC lagging for iterative mode: fresh PC on first iteration,
+        # reuse from iteration 1 onward to avoid redundant refactorization.
+        if is_iterative:
             if iteration == 0:
-                pc_sub.setReusePreconditioner(False)
+                pc.setReusePreconditioner(False)
                 pc_lagged = False
             elif iteration == 1 and not pc_lagged:
-                pc_sub.setReusePreconditioner(True)
+                pc.setReusePreconditioner(True)
                 pc_lagged = True
-        else:
-            # --- Full-system path (direct solver only) ---
-            pin_inactive_dofs(A, b, inactive_dofs)
 
         jac_time = _time.time() - jac_t0
         _memory_snapshot(iteration, "post-jacobian")
@@ -862,17 +887,20 @@ def solve_newton(
         du.x.array[:] = 0.0
 
         _memory_snapshot(iteration, "pre-ksp-solve")
-        if is_iterative and active_is is not None:
-            du_sub.set(0.0)
-            ksp_sub.solve(b_sub, du_sub)
-            # Scatter solution back to full du vector.
-            if len(active_dofs_local) > 0:
-                du.x.array[active_dofs_local] = du_sub.array
-            ksp_reason = ksp_sub.getConvergedReason()
-        else:
-            ksp.solve(b, du.x.petsc_vec)
-            ksp_reason = ksp.getConvergedReason()
+        ksp.solve(b, du.x.petsc_vec)
+        ksp_reason = ksp.getConvergedReason()
         _memory_snapshot(iteration, "post-ksp-solve")
+
+        # Per-rank KSP diagnostics on first iteration of each step.
+        if n_ranks > 1 and iteration == 0:
+            _rank_report(
+                msh.comm,
+                "KSP",
+                f"iters={ksp.getIterationNumber()},"
+                f" reason={int(ksp.getConvergedReason())}",
+                debug,
+            )
+
         ksp_reason_global = msh.comm.allreduce(int(ksp_reason), op=MPI.MIN)
 
         if ksp_reason_global < 0:
@@ -889,7 +917,7 @@ def solve_newton(
                         "  └─────┴──────────────┴──────────────┴──────────┴───────┴──────────────┘"
                     )
                 _cleanup(owns_workspace)
-                return iteration, True, "converged (KSP-near)"
+                return iteration, True, "converged (KSP-near)", _build_stats()
             if debug:
                 _live_print(
                     f"  │ {iteration:3d} │ {res_norm:12.4e} │ {rel_res:12.4e} │          │   —   │ ABORT: KSP {ksp_reason_global:2d} │"
@@ -898,7 +926,7 @@ def solve_newton(
                     "  └─────┴──────────────┴──────────────┴──────────┴───────┴──────────────┘"
                 )
             _cleanup(owns_workspace)
-            return iteration, False, f"KSP diverged ({ksp_reason_global})"
+            return iteration, False, f"KSP diverged ({ksp_reason_global})", _build_stats()
 
         # After KSP writes owned entries, synchronize to ghost DOFs before any
         # norm checks/line-search evaluations that read the full local vector.
@@ -915,14 +943,16 @@ def solve_newton(
                     "  └─────┴──────────────┴──────────────┴──────────┴───────┴──────────────┘"
                 )
             _cleanup(owns_workspace)
-            return iteration, False, "non-finite linear solution"
+            return iteration, False, "non-finite linear solution", _build_stats()
 
-        du_norm = np.linalg.norm(du.x.array)
+        du_norm_local = np.linalg.norm(du.x.array)
+        du_norm = msh.comm.allreduce(du_norm_local**2, op=MPI.SUM) ** 0.5
 
         # Newton stagnation guard: if KSP returns a (near-)zero update, the
         # residual is at the solver noise floor.  Declare converged rather
         # than looping with zero progress.
-        u_norm = np.linalg.norm(u.x.array)
+        u_norm_local = np.linalg.norm(u.x.array)
+        u_norm = msh.comm.allreduce(u_norm_local**2, op=MPI.SUM) ** 0.5
         du_rel = du_norm / max(u_norm, 1.0)
         if du_rel < 1e-14:
             if debug:
@@ -933,18 +963,18 @@ def solve_newton(
                     "  └─────┴──────────────┴──────────────┴──────────┴───────┴──────────────┘"
                 )
             _cleanup(owns_workspace)
-            return iteration, True, "converged (stagnation)"
+            return iteration, True, "converged (stagnation)", _build_stats()
 
         # Track linear solver iteration count for iterative KSP types.
-        _ksp_ref = ksp_sub if (is_iterative and ksp_sub is not None) else ksp
-        ksp_its = _ksp_ref.getIterationNumber()
+        ksp_its = ksp.getIterationNumber()
+        total_ksp_its += ksp_its
 
         # Record first-iteration KSP count for PC lagging safety valve.
         if iteration == 0:
             first_ksp_its = max(ksp_its, 1)
         # Safety valve: if lagged PC degrades badly, refresh it.
-        if is_iterative and pc_lagged and pc_sub is not None and ksp_its > 3 * first_ksp_its:
-            pc_sub.setReusePreconditioner(False)
+        if is_iterative and pc_lagged and ksp_its > 3 * first_ksp_its:
+            pc.setReusePreconditioner(False)
             pc_lagged = False
 
         # --- Backtracking line search ---
@@ -1013,11 +1043,13 @@ def solve_newton(
             omega *= 0.5
 
         ls_iters = ls_iter + 1
+        total_ls_its += ls_iters
+        last_omega = omega
         _memory_snapshot(iteration, "post-linesearch")
 
         if debug:
             status = f"ω={omega:.3f} ls={ls_iters}"
-            if ksp_its > 1:
+            if n_ranks > 1 or ksp_its > 1:
                 status += f" ki={ksp_its}"
             if ksp_reason < 0:
                 status += f" KSP:{ksp_reason}"
@@ -1041,4 +1073,4 @@ def solve_newton(
         )
 
     _cleanup(owns_workspace)
-    return max_iter, False, "max iterations"
+    return max_iter, False, "max iterations", _build_stats()

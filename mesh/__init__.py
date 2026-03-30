@@ -41,6 +41,7 @@ from .dolfinx_setup import (
     build_partitioned_dolfinx_mesh,
     tag_interfaces_and_boundaries,
 )
+from .mesh_quality import evaluate_mesh_quality, MeshQualityReport
 
 __all__ = [
     "Face",
@@ -67,4 +68,6 @@ __all__ = [
     "configure_streaming_stdio",
     "build_partitioned_dolfinx_mesh",
     "tag_interfaces_and_boundaries",
+    "evaluate_mesh_quality",
+    "MeshQualityReport",
 ]

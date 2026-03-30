@@ -23,9 +23,12 @@ Parallel Notes:
     `ghostUpdate` remain at their original synchronization points.
 """
 
+import csv
 import os
+import resource
 import time
 import json
+from pathlib import Path
 
 import numpy as np
 import ufl
@@ -155,6 +158,64 @@ def _print_step_diagnostics(
             )
 
 
+_CSV_COLUMNS = [
+    # ── Step identification ──
+    "step",
+    "time_s",
+    "dt_s",
+    # ── Mesh / parallel ──
+    "mpi_ranks_total",
+    "mpi_ranks_active",
+    "active_cells",
+    "total_cells",
+    "active_dofs",
+    "inactive_dofs",
+    # ── Newton solver ──
+    "newton_iters",
+    "converged",
+    "newton_msg",
+    "res0",
+    "res_final",
+    "rel_res_final",
+    "total_ksp_its",
+    "total_ls_its",
+    "final_omega",
+    # ── Timings ──
+    "time_newton_s",
+    "time_perzyna_s",
+    "time_proj_s",
+    "time_io_s",
+    "time_step_total_s",
+    # ── Constitutive ──
+    "n_sub_steps",
+    "yielding_cells",
+    "max_yield_f_MPa",
+    # ── Field statistics ──
+    "max_disp_mm",
+    "z_sag_mm",
+    "max_von_mises_MPa",
+    "max_principal_MPa",
+    "max_plastic_strain",
+    # ── Stability / resource ──
+    "dt_stable_limit_s",
+    "rss_GiB",
+    # ── Cumulatives ──
+    "cumul_newton_iters",
+    "cumul_ksp_its",
+    "cumul_wall_s",
+]
+
+
+def _current_rss_gib() -> float:
+    """Return current process RSS in GiB (platform-aware)."""
+    ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS reports bytes, Linux reports kB.
+    import sys
+    if sys.platform == "darwin":
+        return ru / (1024 ** 3)
+    return ru * 1024 / (1024 ** 3)
+
+
 def run_simulation(
     msh,
     V,
@@ -166,6 +227,7 @@ def run_simulation(
     birth_time_func,
     is_active_func,
     cells_layers_func,
+    mpi_rank_func,
     cell_to_dofs,
     support,
     cfg,
@@ -188,6 +250,7 @@ def run_simulation(
         birth_time_func: DG0 output field of cell birth times.
         is_active_func: DG0 output field for active/inactive status.
         cells_layers_func: DG0 output field for layer id.
+        mpi_rank_func: DG0 output field for owning MPI rank.
         cell_to_dofs: Map from cell id to vector DOF ids.
         support: Support-cell mapping for newly activated cells.
         cfg: Full simulation configuration dictionary.
@@ -650,6 +713,7 @@ def run_simulation(
     )
 
     total_newton_iters = 0
+    total_ksp_its_all = 0
     total_perzyna_steps = 0
     total_time_newton = 0.0
     total_time_perzyna = 0.0
@@ -713,6 +777,7 @@ def run_simulation(
 
     if comm.rank == 0:
         log_message(f"\nTime stepping: {len(times)} steps")
+        log_message(f"  MPI ranks: {comm.size}")
         if checkpoint_resume_enabled:
             log_message(
                 "  Resume source: "
@@ -724,31 +789,11 @@ def run_simulation(
         )
         if newton_workspace.linear_solver_mode == "iterative":
             iterative_cfg = solver_cfg.get("iterative", {})
-            ksp_type = iterative_cfg.get(
-                "ksp_type",
-                solver_cfg.get("iterative_ksp_type", "gmres"),
+            gmres_restart = iterative_cfg.get("gmres_restart", 30)
+            log_message(
+                f"  Iterative solver: gmres/bjacobi+lu on full pinned system"
+                f" (restart={gmres_restart})"
             )
-            pc_type = iterative_cfg.get(
-                "pc_type",
-                solver_cfg.get("iterative_pc_type", "bjacobi"),
-            )
-            sub_pc_type = iterative_cfg.get("sub_pc_type", "ilu")
-            ilu_levels = iterative_cfg.get("ilu_levels", 0)
-            gmres_restart = iterative_cfg.get(
-                "gmres_restart",
-                solver_cfg.get("iterative_gmres_restart", 200),
-            )
-            if pc_type in ("bjacobi", "asm"):
-                log_message(
-                    f"  Iterative KSP/PC: {ksp_type}/{pc_type}"
-                    f" (sub_pc={sub_pc_type}, ilu_levels={ilu_levels},"
-                    f" restart={gmres_restart})"
-                )
-            else:
-                log_message(
-                    f"  Iterative KSP/PC: {ksp_type}/{pc_type}"
-                    f" (restart={gmres_restart})"
-                )
         if collective_debug:
             log_message(
                 "  DEBUG: collective probes enabled "
@@ -785,6 +830,7 @@ def run_simulation(
                 birth_time_func,
                 is_active_func,
                 cells_layers_func,
+                mpi_rank_func,
                 materials.E,
                 materials.G,
                 materials.nu,
@@ -804,6 +850,16 @@ def run_simulation(
             t_prev = float(resume_time) if checkpoint_resume_enabled else (times[0] - dt_default)
             # Exact wall-clock start of the time-stepping loop (excludes setup).
             loop_start_time = time.time()
+
+            # CSV metrics logger (rank 0 only).
+            csv_path = Path(disp_path).parent / "step_metrics.csv"
+            csv_file = None
+            csv_writer = None
+            if comm.rank == 0:
+                csv_file = open(csv_path, "w", newline="", encoding="utf-8")
+                csv_writer = csv.DictWriter(csv_file, fieldnames=_CSV_COLUMNS)
+                csv_writer.writeheader()
+                csv_file.flush()
 
             for local_idx, t_val in enumerate(times):
                 step = start_idx + local_idx
@@ -876,10 +932,15 @@ def run_simulation(
                         / np.maximum(materials.e_arr[active_mask], 1.0e-12)
                     )
 
+                # Rebuild forms with cell + facet restricted assembly.
+                # Cell restriction: only integrate dx over active cells.
+                # Facet restriction: only integrate dS over facets adjacent
+                # to at least one active cell.  Combined, this makes assembly
+                # cost O(active) instead of O(total_mesh).
                 u_backup = u.x.array.copy()
 
                 t_newton_start = time.time()
-                n_iter, converged, msg = solve_newton(
+                n_iter, converged, msg, newton_stats = solve_newton(
                     u,
                     V,
                     msh,
@@ -1102,6 +1163,7 @@ def run_simulation(
                 global_max_ps = comm.allreduce(local_max_ps, op=MPI.MAX)
 
                 total_newton_iters += int(n_iter)
+                total_ksp_its_all += newton_stats.get("total_ksp_its", 0)
                 total_perzyna_steps += int(n_sub)
                 total_time_newton += float(time_newton)
                 total_time_perzyna += float(time_perzyna)
@@ -1190,6 +1252,57 @@ def run_simulation(
                             f"       Explicit limit:  dt_sub <= {dt_stable_limit:.2e} s (eta/E)"
                         )
 
+                # Write CSV row (rank 0 only; allreduce is collective).
+                local_active_count = int(np.sum(
+                    birth_times_dolfinx[:num_owned_cells] <= t_val
+                ))
+                n_active_csv = comm.allreduce(local_active_count, op=MPI.SUM)
+                n_total_csv = comm.allreduce(int(num_owned_cells), op=MPI.SUM)
+                # Ranks that own at least one active cell.
+                rank_has_active = 1 if local_active_count > 0 else 0
+                n_active_ranks = comm.allreduce(rank_has_active, op=MPI.SUM)
+                if csv_writer is not None:
+                    elapsed_step = time.time() - t0
+                    csv_writer.writerow({
+                        "step": step,
+                        "time_s": f"{t_val:.6f}",
+                        "dt_s": f"{dt:.6e}",
+                        "mpi_ranks_total": comm.size,
+                        "mpi_ranks_active": n_active_ranks,
+                        "active_cells": n_active_csv,
+                        "total_cells": n_total_csv,
+                        "active_dofs": newton_stats.get("n_active_dofs", ""),
+                        "inactive_dofs": newton_stats.get("n_inactive_dofs", ""),
+                        "newton_iters": n_iter,
+                        "converged": int(converged),
+                        "newton_msg": msg,
+                        "res0": f"{newton_stats.get('res0', float('nan')):.6e}",
+                        "res_final": f"{newton_stats.get('res_final', float('nan')):.6e}",
+                        "rel_res_final": f"{newton_stats.get('rel_res_final', float('nan')):.6e}",
+                        "total_ksp_its": newton_stats.get("total_ksp_its", 0),
+                        "total_ls_its": newton_stats.get("total_ls_its", 0),
+                        "final_omega": f"{newton_stats.get('final_omega', 1.0):.4f}",
+                        "time_newton_s": f"{time_newton:.4f}",
+                        "time_perzyna_s": f"{time_perzyna:.4f}",
+                        "time_proj_s": f"{time_proj:.4f}",
+                        "time_io_s": f"{time_io:.4f}",
+                        "time_step_total_s": f"{elapsed_step:.4f}",
+                        "n_sub_steps": n_sub,
+                        "yielding_cells": global_yielding,
+                        "max_yield_f_MPa": f"{global_max_f:.6e}",
+                        "max_disp_mm": f"{global_max_u:.6e}",
+                        "z_sag_mm": f"{global_min_z:.6e}",
+                        "max_von_mises_MPa": f"{global_max_vm:.6e}",
+                        "max_principal_MPa": f"{global_max_ps:.6e}",
+                        "max_plastic_strain": f"{global_max_epsvp:.6e}",
+                        "dt_stable_limit_s": f"{dt_stable_limit:.6e}" if np.isfinite(dt_stable_limit) else "",
+                        "rss_GiB": f"{_current_rss_gib():.3f}",
+                        "cumul_newton_iters": total_newton_iters,
+                        "cumul_ksp_its": total_ksp_its_all,
+                        "cumul_wall_s": f"{time.time() - loop_start_time:.2f}",
+                    })
+                    csv_file.flush()
+
                 t_prev = t_val
 
             total_loop_time = time.time() - loop_start_time
@@ -1229,6 +1342,10 @@ def run_simulation(
                 log_message(f"    └─ Overhead (MPI/Misc):  {total_time_overhead:.2f} s")
                 log_message("  ========================================================================")
                 log_message(f"  Log saved to: {log_path}")
+                log_message(f"  CSV metrics saved to: {csv_path}")
+            # Close CSV file after loop completes (before finally).
+            if csv_file is not None:
+                csv_file.close()
     finally:
         if newton_workspace is not None:
             newton_workspace.destroy()

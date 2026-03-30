@@ -19,8 +19,9 @@ geometry:
 # -----------------------------------------------------------------------------
 mesh:
   n_length: 100        # Divisions along length
-  n_span: 60           # Divisions along span
-  n_thickness: 3        # Divisions through thickness
+  n_span: 90           # Divisions along span
+  n_thickness: 2        # Divisions through thickness
+  partitioner: strip   # strip | default (ParMETIS/SCOTCH)
 
 # -----------------------------------------------------------------------------
 # Rheology Inputs 
@@ -83,19 +84,25 @@ solver:
     mumps_icntl_14: 200   # MUMPS extra workspace percentage
     out_of_core: false    # MUMPS OOC: pages factorization to disk (trades speed for memory)
   iterative:
-    ksp_type: preonly      # Direct solve on active-DOF subsystem
-    pc_type: lu           # Exact LU factorization of active subsystem (~1K-22K DOFs)
-    rtol: 1.0e-4          # (unused with preonly)
-    atol: 0               # (unused with preonly)
-    max_it: 500           # (unused with preonly)
-    gmres_restart: 100    # (unused with preonly)
+    # Full-system solve with inactive DOFs pinned to identity rows.
+    # GMRES + Additive Schwarz with overlapping ILU(1) sub-solvers.
+    # ASM with overlap provides cross-rank coupling that block Jacobi lacks,
+    # preventing KSP iteration explosion with multiple ranks.
+    pc_type: asm            # Additive Schwarz (was: bjacobi)
+    asm_overlap: 2          # Overlap depth between subdomains
+    sub_pc_type: ilu        # Sub-solver per subdomain
+    ilu_levels: 1           # ILU(1) fill for better preconditioning
+    rtol: 1.0e-4            # GMRES relative tolerance
+    atol: 1.0e-12           # GMRES absolute tolerance
+    max_it: 500             # GMRES max iterations
+    gmres_restart: 60       # GMRES restart (increased for ASM convergence)
 
 # -----------------------------------------------------------------------------
 # Time Stepping
 # -----------------------------------------------------------------------------
 time_stepping:
   n_steps: 300       # Number of time steps
-  max_steps: 25      # Stop after this many steps (0 = run all). For benchmarking.
+  max_steps: 0       # Stop after this many steps (0 = run all). For benchmarking.
   start_offset: 0.1     # Offset from minimum birth time [s]
   end_multiplier: 1.05  # Multiplier for maximum birth time
 
@@ -117,6 +124,19 @@ output:
   log_file: ""                   # Optional override (blank -> sim_run.log in output/run_<YYMMDD_HHMMSS>/)
 
 # -----------------------------------------------------------------------------
+# Mesh Quality Thresholds (all optional — sensible defaults used if absent)
+# -----------------------------------------------------------------------------
+mesh_quality:
+  enabled: true                    # Set false to skip quality checks entirely
+  aspect_ratio_threshold: 10.0     # Flag elements above this ratio
+  min_scaled_jacobian: 0.1         # Flag elements below this value
+  jacobian_near_zero_tol: 1.0e-10  # Jacobian below this is "near-zero"
+  volume_variation_threshold: 20.0 # Max/min volume ratio for warning
+  max_skewness: 0.5                # Flag elements above this skewness
+  max_warping: 0.1                 # Flag elements above this (normalised)
+  fail_on_negative_jacobian: true  # Abort simulation if negative Jacobian found
+
+# -----------------------------------------------------------------------------
 # Debug (all optional)
 # -----------------------------------------------------------------------------
 debug:
@@ -126,7 +146,7 @@ debug:
   output_io: false                # Probe enter/exit around VTX output writes
   step_setup: false             # Probe rank progress in pre-solver step setup
   step_setup_max_steps: 3       # Only print setup probes for first N steps
-  newton_memory_tracking: false   # Disabled for multi-rank benchmarks (collectives can stall)
+  newton_memory_tracking: false   # Per-rank RSS tracking (MPI-safe) — disabled to avoid extra collectives
   newton_memory_every_iter: 1     # Emit memory line every N Newton iterations
   newton_memory_collect_garbage: false  # Run Python GC before memory snapshots
   newton_memory_track_mumps: false  # Include MUMPS INFOG(16/26/29) stats (direct solver only)

@@ -33,6 +33,7 @@ from mesh import (
     build_partitioned_dolfinx_mesh,
     compute_cell_permutation,
     configure_streaming_stdio,
+    evaluate_mesh_quality,
     reorder_cell_data,
     tag_interfaces_and_boundaries,
 )
@@ -175,7 +176,20 @@ def main():
         )
 
         # Step 4: Partition and create the distributed DOLFINx mesh.
-        msh, cells_lst, cells_layers = build_partitioned_dolfinx_mesh(vault_mesh, comm)
+        partitioner_mode = mesh_cfg.get("partitioner", "strip")
+        msh, cells_lst, cells_layers = build_partitioned_dolfinx_mesh(
+            vault_mesh, comm, partitioner_mode=partitioner_mode,
+        )
+
+        # Step 4b: Evaluate mesh quality on the DOLFINx mesh.
+        quality_report = evaluate_mesh_quality(msh, cfg, comm)
+        if not quality_report.is_valid:
+            if comm.rank == 0:
+                print(
+                    "  FATAL: Mesh contains invalid elements. Aborting.",
+                    flush=True,
+                )
+            comm.Abort(1)
 
         # Step 5: Reorder cell-wise arrays into DOLFINx local+ghost ordering.
         try:
@@ -209,6 +223,11 @@ def main():
         is_active_func.x.array[:] = 0.0
         # Initialize and scatter once so all ranks start from identical indicator state.
         is_active_func.x.scatter_forward()
+
+        mpi_rank_func = fem.Function(materials.V_DG0, name="mpi_rank")
+        num_owned_cells = msh.topology.index_map(msh.topology.dim).size_local
+        mpi_rank_func.x.array[:num_owned_cells] = float(comm.rank)
+        mpi_rank_func.x.scatter_forward()
 
         # Step 7: Tag inter-/intra-layer interior facets and Dirichlet boundaries.
         (
@@ -287,6 +306,7 @@ def main():
             birth_time_func,
             is_active_func,
             cells_layers_func,
+            mpi_rank_func,
             cell_to_dofs,
             support,
             cfg,
