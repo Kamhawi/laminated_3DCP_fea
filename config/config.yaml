@@ -48,15 +48,26 @@ hardening:
 # Interface Parameters
 # -----------------------------------------------------------------------------
 interface:
-  gamma_bonded_mult: 40.0       # Intra-layer SIP penalty multiplier
-  gamma_boundary_mult: 300.0    # Dirichlet BC penalty multiplier
+  # -- Intra-layer element coupling (SIP penalty on dS(2)) --
+  # Penalizes displacement jumps between DG elements within the same layer.
+  # Actual penalty stiffness = gamma_bonded_mult * E / h_avg.
+  # Higher -> stiffer coupling (less interpenetration), but too high -> ill-conditioning.
+  gamma_bonded_mult: 40.0
 
-  G_Ic: 0.08                    # Mode I fracture energy [N/mm]
-  G_IIc: 0.14                   # Mode II fracture energy [N/mm]
-  eta_BK: 1.5                   # Benzeggagh-Kenane exponent [-]
+  # Weak Dirichlet (Nitsche) penalty: same idea, applied at fixed boundaries.
+  # Actual penalty stiffness = gamma_boundary_mult * E / h_cell.
+  gamma_boundary_mult: 300.0
+
+  # -- Inter-layer bond strength (cohesive traction-separation law on dS(1)) --
+  # These control when and how layers debond under tension/shear.
+  G_Ic: 0.08                    # Mode I (opening) fracture energy [N/mm]
+  G_IIc: 0.14                   # Mode II (shear) fracture energy [N/mm]
+  eta_BK: 1.5                   # Benzeggagh-Kenane mixed-mode interaction exponent [-]
+  # Nozzle pressure affects bond quality: beta = 1 - exp(-p / tau_sub).
+  # Higher pressure -> better inter-layer bond -> higher effective fracture energy.
   nozzle_pressure: 70000.0      # Nozzle deposition pressure [Pa]
-  residual_stiffness_ratio: 0.05
-  K_min_mult: 0.001              # Lower bound multiplier for cohesive stiffness: K_min = K_min_mult * E/h
+  residual_stiffness_ratio: 0.05 # Min stiffness fraction after full damage (avoids singularity)
+  K_min_mult: 0.001              # Lower bound on cohesive stiffness: K_min = K_min_mult * E/h
 
 # -----------------------------------------------------------------------------
 # Activation Parameters

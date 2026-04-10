@@ -789,10 +789,13 @@ def run_simulation(
         )
         if newton_workspace.linear_solver_mode == "iterative":
             iterative_cfg = solver_cfg.get("iterative", {})
+            ksp_type = iterative_cfg.get("ksp_type", "gmres")
+            pc_type = iterative_cfg.get("pc_type", "bjacobi")
+            sub_pc_type = iterative_cfg.get("sub_pc_type", "lu")
             gmres_restart = iterative_cfg.get("gmres_restart", 30)
             log_message(
-                f"  Iterative solver: gmres/bjacobi+lu on full pinned system"
-                f" (restart={gmres_restart})"
+                f"  Iterative solver: {ksp_type}/{pc_type}+{sub_pc_type}"
+                f" on full pinned system (restart={gmres_restart})"
             )
         if collective_debug:
             log_message(

@@ -47,9 +47,8 @@ class NewtonLinearWorkspace:
         self.assemble_mode = 0
 
         # --- Active-DOF reduction state ---
-        self.use_reduction = (
-            bool(self.solver_cfg.get("active_dof_reduction", False))
-            and self.linear_solver_mode == "iterative"
+        self.use_reduction = bool(
+            self.solver_cfg.get("active_dof_reduction", False)
         )
         self._is_active = None   # PETSc IS for active owned DOFs
         self._A_red = None       # Reduced Jacobian (submatrix)
@@ -94,9 +93,35 @@ class NewtonLinearWorkspace:
             self.assemble_mode = 0
 
     def _configure_reduced_ksp(self):
-        """Configure the reduced-system KSP with the same iterative settings."""
-        iterative_cfg = self.solver_cfg.get("iterative", {})
+        """Configure the reduced-system KSP matching the main solver mode."""
         ksp = self._ksp_red
+        ksp.setOptionsPrefix("red_")
+
+        if self.linear_solver_mode == "direct":
+            self._configure_reduced_ksp_direct(ksp)
+        else:
+            self._configure_reduced_ksp_iterative(ksp)
+
+        ksp.setFromOptions()
+
+    def _configure_reduced_ksp_direct(self, ksp):
+        """Set up reduced KSP for direct LU+MUMPS solve."""
+        direct_cfg = self.solver_cfg.get("direct", {})
+        mumps_icntl_14 = int(direct_cfg.get("mumps_icntl_14", 200))
+
+        ksp.setType("preonly")
+        pc = ksp.getPC()
+        pc.setType("lu")
+        pc.setFactorSolverType("mumps")
+
+        opts = PETSc.Options()
+        opts.setValue("-red_mat_mumps_icntl_14", str(mumps_icntl_14))
+        if direct_cfg.get("out_of_core", False):
+            opts.setValue("-red_mat_mumps_icntl_22", "1")
+
+    def _configure_reduced_ksp_iterative(self, ksp):
+        """Set up reduced KSP with the configured iterative settings."""
+        iterative_cfg = self.solver_cfg.get("iterative", {})
         ksp_type = str(iterative_cfg.get("ksp_type", "gmres")).strip().lower()
         pc_type = str(iterative_cfg.get("pc_type", "bjacobi")).strip().lower()
         ksp_rtol = float(iterative_cfg.get("rtol", 1.0e-8))
@@ -110,9 +135,6 @@ class NewtonLinearWorkspace:
         ksp.setTolerances(rtol=ksp_rtol, atol=ksp_atol, max_it=ksp_max_it)
         if ksp_type in ("gmres", "fgmres") and gmres_restart > 0:
             ksp.setGMRESRestart(gmres_restart)
-
-        # Set prefix BEFORE setting options so PETSc maps them correctly.
-        ksp.setOptionsPrefix("red_")
 
         opts = PETSc.Options()
         sub_pc_type = str(iterative_cfg.get("sub_pc_type", "ilu")).strip().lower()
@@ -129,7 +151,6 @@ class NewtonLinearWorkspace:
                 opts.setValue("-red_sub_pc_factor_mat_ordering_type", "rcm")
                 overlap = int(iterative_cfg.get("asm_overlap", 1))
                 opts.setValue("-red_pc_asm_overlap", str(overlap))
-        ksp.setFromOptions()
 
     def destroy_reduced(self):
         """Release PETSc objects for the reduced system (between steps).
