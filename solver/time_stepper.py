@@ -40,6 +40,18 @@ from petsc4py import PETSc
 
 from config.config_utils import get_checkpoint_dir
 from materials.material_state import update_perzyna_state_cellwise
+from solver.barrel_vault_output import (
+    build_event_record,
+    build_interlayer_output_data,
+    concat_gathered_rows,
+    compute_step_output_summary,
+    finalize_barrel_vault_results,
+    get_barrel_vault_output_config,
+    mean_birth_interval,
+    safe_ratio,
+    write_facet_history_rows,
+    write_span_profile_rows,
+)
 from solver.kinematics import (
     epsilon,
     init_newly_activated_displacement,
@@ -203,6 +215,27 @@ _CSV_COLUMNS = [
     "cumul_newton_iters",
     "cumul_ksp_its",
     "cumul_wall_s",
+    # ── Barrel-vault outputs ──
+    "active_layers",
+    "new_cells",
+    "cantilever_sag_mm",
+    "max_opening_mm",
+    "max_damage",
+    "junction_opening_mm",
+    "junction_damage",
+    "crown_opening_mm",
+    "crown_damage",
+    "front_opening_mm",
+    "front_damage",
+    "front_active_facets",
+    "front_localization_ratio",
+    "front_vs_crown_opening_ratio",
+    "crown_vs_junction_opening_ratio",
+    "junction_opening_ratio",
+    "junction_damage_ratio",
+    "first_damage_seen",
+    "first_gap_seen",
+    "first_junction_opening_seen",
 ]
 
 
@@ -236,6 +269,7 @@ def run_simulation(
     log_path,
     interior_facet_tags=None,
     simulation_start_time=None,
+    cell_output_data=None,
 ):
     """Execute the full transient simulation loop.
 
@@ -259,6 +293,8 @@ def run_simulation(
         log_path: Rank-0 log file path.
         simulation_start_time: Optional wall-clock start time for the full
             simulation workflow.
+        cell_output_data: Optional barrel-vault cell metadata in DOLFINx
+            ordering used to write extra run outputs.
 
     Returns:
         None.
@@ -507,6 +543,25 @@ def run_simulation(
                 _map_c.size_local + _map_c.num_ghosts, dtype=np.int32
             )
             il_h_cells = np.asarray(_dolfinx_h(msh._cpp_object, tdim, _all_cells))
+
+    barrel_output_cfg = get_barrel_vault_output_config(cfg)
+    interlayer_output_data = build_interlayer_output_data(
+        msh, interior_facet_tags, cell_output_data, cfg
+    ) if (
+        barrel_output_cfg["enabled"] and cell_output_data is not None
+    ) else None
+    gathered_birth_times = comm.allgather(
+        np.asarray(birth_times_dolfinx[:num_owned_cells], dtype=np.float64)
+    )
+    global_birth_times = (
+        np.concatenate(gathered_birth_times)
+        if gathered_birth_times
+        else np.asarray(birth_times_dolfinx[:num_owned_cells], dtype=np.float64)
+    )
+    front_window_time = (
+        barrel_output_cfg["front_window_time_mult"]
+        * mean_birth_interval(global_birth_times)
+    )
 
     def save_checkpoint(step_idx, t_val):
         """Save a single rank-agnostic checkpoint file for the current step."""
@@ -855,14 +910,90 @@ def run_simulation(
             loop_start_time = time.time()
 
             # CSV metrics logger (rank 0 only).
-            csv_path = Path(disp_path).parent / "step_metrics.csv"
+            run_dir = Path(disp_path).parent
+            csv_path = run_dir / "step_metrics.csv"
             csv_file = None
             csv_writer = None
+            facet_history_path = run_dir / "facet_history.csv"
+            facet_history_file = None
+            facet_history_writer = None
+            span_profiles_path = run_dir / "span_profiles.csv"
+            span_profiles_file = None
+            span_profiles_writer = None
+            results_path = run_dir / "barrel_vault_results.json"
             if comm.rank == 0:
                 csv_file = open(csv_path, "w", newline="", encoding="utf-8")
                 csv_writer = csv.DictWriter(csv_file, fieldnames=_CSV_COLUMNS)
                 csv_writer.writeheader()
                 csv_file.flush()
+                if barrel_output_cfg["enabled"] and barrel_output_cfg["write_facet_history"]:
+                    facet_history_file = open(
+                        facet_history_path, "w", newline="", encoding="utf-8"
+                    )
+                    facet_history_writer = csv.DictWriter(
+                        facet_history_file,
+                        fieldnames=[
+                            "step",
+                            "time_s",
+                            "active_layers",
+                            "facet_key",
+                            "span_index",
+                            "thickness_index",
+                            "lower_layer_zero_based",
+                            "upper_layer_zero_based",
+                            "region_label",
+                            "junction_flag",
+                            "front_band_flag",
+                            "centroid_x_mm",
+                            "centroid_y_mm",
+                            "centroid_z_mm",
+                            "jump_n_mm",
+                            "jump_n_open_mm",
+                            "jump_t_mm",
+                            "mode_i_drive",
+                            "mode_ii_drive",
+                            "facet_damage",
+                            "damage_max_pair",
+                        ],
+                    )
+                    facet_history_writer.writeheader()
+                    facet_history_file.flush()
+                if barrel_output_cfg["enabled"] and barrel_output_cfg["write_span_profiles"]:
+                    span_profiles_file = open(
+                        span_profiles_path, "w", newline="", encoding="utf-8"
+                    )
+                    span_profiles_writer = csv.DictWriter(
+                        span_profiles_file,
+                        fieldnames=[
+                            "step",
+                            "time_s",
+                            "active_layers",
+                            "lower_layer_zero_based",
+                            "span_index",
+                            "region_label",
+                            "junction_flag",
+                            "max_opening_mm",
+                            "max_damage",
+                            "mean_opening_mm",
+                            "mean_damage",
+                        ],
+                    )
+                    span_profiles_writer.writeheader()
+                    span_profiles_file.flush()
+
+            event_state = {
+                "first_damage": None,
+                "first_visible_gap": None,
+                "first_junction_opening": None,
+            }
+            peak_state = {
+                "front_localization_ratio": 0.0,
+                "junction_damage_ratio": 0.0,
+                "junction_opening_ratio": 0.0,
+                "front_vs_crown_opening_ratio": 0.0,
+                "crown_vs_junction_opening_ratio": 0.0,
+            }
+            final_step_summary = {}
 
             for local_idx, t_val in enumerate(times):
                 step = start_idx + local_idx
@@ -870,6 +1001,7 @@ def run_simulation(
                 if hasattr(materials, "t_current"):
                     materials.t_current.value = t_val
                 dt = dt_default if step == 0 else max(t_val - t_prev, 0.0)
+                newly_active_cells = np.empty(0, dtype=np.int32)
 
                 if step == 0 and start_idx == 0:
                     u.x.array[:] = 0.0
@@ -1165,6 +1297,244 @@ def run_simulation(
                 local_max_ps = float(np.max(max_ps_arr)) if max_ps_arr.size > 0 else 0.0
                 global_max_ps = comm.allreduce(local_max_ps, op=MPI.MAX)
 
+                local_active_layer = -1
+                if np.any(active_mask):
+                    if cell_output_data is not None:
+                        local_active_layer = int(
+                            np.max(cell_output_data.length_index[active_mask])
+                        )
+                    else:
+                        local_active_layer = int(
+                            np.max(cells_layers_func.x.array[active_mask])
+                        )
+                active_layers = comm.allreduce(local_active_layer, op=MPI.MAX) + 1
+                new_cells_global = comm.allreduce(
+                    int(len(newly_active_cells)), op=MPI.SUM
+                )
+
+                barrel_step_summary = {
+                    "cantilever_sag_mm": 0.0,
+                    "max_opening_mm": 0.0,
+                    "max_damage": 0.0,
+                    "junction_opening_mm": 0.0,
+                    "junction_damage": 0.0,
+                    "crown_opening_mm": 0.0,
+                    "crown_damage": 0.0,
+                    "front_opening_mm": 0.0,
+                    "front_damage": 0.0,
+                    "front_active_facets": 0,
+                    "front_localization_ratio": 0.0,
+                    "front_vs_crown_opening_ratio": 0.0,
+                    "crown_vs_junction_opening_ratio": 0.0,
+                    "junction_opening_ratio": 0.0,
+                    "junction_damage_ratio": 0.0,
+                }
+                root_output_rows = None
+                if (
+                    barrel_output_cfg["enabled"]
+                    and cell_output_data is not None
+                    and interlayer_output_data is not None
+                ):
+                    local_output = compute_step_output_summary(
+                        u=u,
+                        materials=materials,
+                        cell_to_dofs=cell_to_dofs,
+                        birth_times=birth_times_dolfinx,
+                        cfg=cfg,
+                        output_cfg=barrel_output_cfg,
+                        cell_data=cell_output_data,
+                        interlayer_data=interlayer_output_data,
+                        t_val=t_val,
+                        active_layers=active_layers,
+                        front_window_time=front_window_time,
+                    )
+                    local_summary = local_output["summary"]
+                    barrel_step_summary = {
+                        "cantilever_sag_mm": float(
+                            comm.allreduce(local_summary["cantilever_sag_mm"], op=MPI.MIN)
+                        ),
+                        "max_opening_mm": float(
+                            comm.allreduce(local_summary["max_opening_mm"], op=MPI.MAX)
+                        ),
+                        "max_damage": float(
+                            comm.allreduce(local_summary["max_damage"], op=MPI.MAX)
+                        ),
+                        "junction_opening_mm": float(
+                            comm.allreduce(local_summary["junction_opening_mm"], op=MPI.MAX)
+                        ),
+                        "junction_damage": float(
+                            comm.allreduce(local_summary["junction_damage"], op=MPI.MAX)
+                        ),
+                        "crown_opening_mm": float(
+                            comm.allreduce(local_summary["crown_opening_mm"], op=MPI.MAX)
+                        ),
+                        "crown_damage": float(
+                            comm.allreduce(local_summary["crown_damage"], op=MPI.MAX)
+                        ),
+                        "front_opening_mm": float(
+                            comm.allreduce(local_summary["front_opening_mm"], op=MPI.MAX)
+                        ),
+                        "front_damage": float(
+                            comm.allreduce(local_summary["front_damage"], op=MPI.MAX)
+                        ),
+                        "front_active_facets": int(
+                            comm.allreduce(local_summary["front_active_facets"], op=MPI.SUM)
+                        ),
+                    }
+                    barrel_step_summary["front_localization_ratio"] = safe_ratio(
+                        barrel_step_summary["front_opening_mm"],
+                        barrel_step_summary["crown_opening_mm"],
+                    )
+                    barrel_step_summary["front_vs_crown_opening_ratio"] = (
+                        barrel_step_summary["front_localization_ratio"]
+                    )
+                    barrel_step_summary["crown_vs_junction_opening_ratio"] = safe_ratio(
+                        barrel_step_summary["crown_opening_mm"],
+                        barrel_step_summary["junction_opening_mm"],
+                    )
+                    barrel_step_summary["junction_opening_ratio"] = safe_ratio(
+                        barrel_step_summary["junction_opening_mm"],
+                        barrel_step_summary["max_opening_mm"],
+                    )
+                    barrel_step_summary["junction_damage_ratio"] = safe_ratio(
+                        barrel_step_summary["junction_damage"],
+                        barrel_step_summary["max_damage"],
+                    )
+
+                    gathered_rows = comm.gather(local_output["active_rows"], root=0)
+                    if comm.rank == 0:
+                        root_output_rows = concat_gathered_rows(gathered_rows)
+                        if (
+                            event_state["first_damage"] is None
+                            and root_output_rows["facet_key"].size > 0
+                        ):
+                            damage_mask = (
+                                root_output_rows["facet_damage"]
+                                >= barrel_output_cfg["damage_threshold"]
+                            )
+                            if np.any(damage_mask):
+                                damage_idx = int(
+                                    np.flatnonzero(damage_mask)[
+                                        np.argmax(root_output_rows["facet_damage"][damage_mask])
+                                    ]
+                                )
+                                event_state["first_damage"] = build_event_record(
+                                    root_output_rows,
+                                    damage_idx,
+                                    step,
+                                    t_val,
+                                    active_layers,
+                                )
+                        if (
+                            event_state["first_visible_gap"] is None
+                            and root_output_rows["facet_key"].size > 0
+                        ):
+                            gap_mask = (
+                                root_output_rows["jump_n_open_mm"]
+                                >= barrel_output_cfg["gap_threshold"]
+                            )
+                            if np.any(gap_mask):
+                                gap_idx = int(
+                                    np.flatnonzero(gap_mask)[
+                                        np.argmax(root_output_rows["jump_n_open_mm"][gap_mask])
+                                    ]
+                                )
+                                event_state["first_visible_gap"] = build_event_record(
+                                    root_output_rows,
+                                    gap_idx,
+                                    step,
+                                    t_val,
+                                    active_layers,
+                                )
+                        if (
+                            event_state["first_junction_opening"] is None
+                            and root_output_rows["facet_key"].size > 0
+                        ):
+                            junction_mask = (
+                                root_output_rows["junction_flag"].astype(bool)
+                                & (root_output_rows["jump_n_open_mm"] > 0.0)
+                            )
+                            if np.any(junction_mask):
+                                junction_idx = int(
+                                    np.flatnonzero(junction_mask)[
+                                        np.argmax(root_output_rows["jump_n_open_mm"][junction_mask])
+                                    ]
+                                )
+                                event_state["first_junction_opening"] = build_event_record(
+                                    root_output_rows,
+                                    junction_idx,
+                                    step,
+                                    t_val,
+                                    active_layers,
+                                )
+
+                        peak_state["front_localization_ratio"] = max(
+                            peak_state["front_localization_ratio"],
+                            barrel_step_summary["front_localization_ratio"],
+                        )
+                        peak_state["junction_damage_ratio"] = max(
+                            peak_state["junction_damage_ratio"],
+                            barrel_step_summary["junction_damage_ratio"],
+                        )
+                        peak_state["junction_opening_ratio"] = max(
+                            peak_state["junction_opening_ratio"],
+                            barrel_step_summary["junction_opening_ratio"],
+                        )
+                        peak_state["front_vs_crown_opening_ratio"] = max(
+                            peak_state["front_vs_crown_opening_ratio"],
+                            barrel_step_summary["front_vs_crown_opening_ratio"],
+                        )
+                        peak_state["crown_vs_junction_opening_ratio"] = max(
+                            peak_state["crown_vs_junction_opening_ratio"],
+                            barrel_step_summary["crown_vs_junction_opening_ratio"],
+                        )
+
+                        should_sample = (
+                            step % barrel_output_cfg["sample_every_steps"] == 0
+                            or step == start_idx + len(times) - 1
+                        )
+                        if (
+                            should_sample
+                            and facet_history_writer is not None
+                            and root_output_rows is not None
+                        ):
+                            write_facet_history_rows(
+                                facet_history_writer,
+                                root_output_rows,
+                                step,
+                                t_val,
+                                active_layers,
+                            )
+                            facet_history_file.flush()
+                        if (
+                            should_sample
+                            and span_profiles_writer is not None
+                            and root_output_rows is not None
+                        ):
+                            write_span_profile_rows(
+                                span_profiles_writer,
+                                root_output_rows,
+                                step,
+                                t_val,
+                                active_layers,
+                            )
+                            span_profiles_file.flush()
+
+                final_step_summary = {
+                    "active_layers": int(active_layers),
+                    "cantilever_sag_mm": float(barrel_step_summary["cantilever_sag_mm"]),
+                    "max_opening_mm": float(barrel_step_summary["max_opening_mm"]),
+                    "max_damage": float(barrel_step_summary["max_damage"]),
+                    "junction_opening_mm": float(
+                        barrel_step_summary["junction_opening_mm"]
+                    ),
+                    "junction_damage": float(barrel_step_summary["junction_damage"]),
+                    "crown_opening_mm": float(barrel_step_summary["crown_opening_mm"]),
+                    "crown_damage": float(barrel_step_summary["crown_damage"]),
+                    "front_opening_mm": float(barrel_step_summary["front_opening_mm"]),
+                    "front_damage": float(barrel_step_summary["front_damage"]),
+                }
+
                 total_newton_iters += int(n_iter)
                 total_ksp_its_all += newton_stats.get("total_ksp_its", 0)
                 total_perzyna_steps += int(n_sub)
@@ -1250,6 +1620,21 @@ def run_simulation(
                         f"       Max Principal:   {global_max_ps:.2e} MPa (Tension)"
                     )
                     log_message(f"       Max Plastic Str: {global_max_epsvp:.2e}")
+                    log_message(
+                        f"       Active Layers:   {active_layers} (new cells: {new_cells_global})"
+                    )
+                    log_message(
+                        "       Open/Damage:     "
+                        f"max_open={barrel_step_summary['max_opening_mm']:.2e} mm, "
+                        f"junction_open={barrel_step_summary['junction_opening_mm']:.2e} mm, "
+                        f"crown_open={barrel_step_summary['crown_opening_mm']:.2e} mm"
+                    )
+                    log_message(
+                        "                        "
+                        f"max_damage={barrel_step_summary['max_damage']:.2e}, "
+                        f"junction_damage={barrel_step_summary['junction_damage']:.2e}, "
+                        f"front/crown={barrel_step_summary['front_vs_crown_opening_ratio']:.2e}"
+                    )
                     if dt_eff > 0.0 and np.isfinite(dt_stable_limit):
                         log_message(
                             f"       Explicit limit:  dt_sub <= {dt_stable_limit:.2e} s (eta/E)"
@@ -1303,6 +1688,52 @@ def run_simulation(
                         "cumul_newton_iters": total_newton_iters,
                         "cumul_ksp_its": total_ksp_its_all,
                         "cumul_wall_s": f"{time.time() - loop_start_time:.2f}",
+                        "active_layers": active_layers,
+                        "new_cells": new_cells_global,
+                        "cantilever_sag_mm": (
+                            f"{barrel_step_summary['cantilever_sag_mm']:.6e}"
+                        ),
+                        "max_opening_mm": (
+                            f"{barrel_step_summary['max_opening_mm']:.6e}"
+                        ),
+                        "max_damage": f"{barrel_step_summary['max_damage']:.6e}",
+                        "junction_opening_mm": (
+                            f"{barrel_step_summary['junction_opening_mm']:.6e}"
+                        ),
+                        "junction_damage": (
+                            f"{barrel_step_summary['junction_damage']:.6e}"
+                        ),
+                        "crown_opening_mm": (
+                            f"{barrel_step_summary['crown_opening_mm']:.6e}"
+                        ),
+                        "crown_damage": f"{barrel_step_summary['crown_damage']:.6e}",
+                        "front_opening_mm": (
+                            f"{barrel_step_summary['front_opening_mm']:.6e}"
+                        ),
+                        "front_damage": f"{barrel_step_summary['front_damage']:.6e}",
+                        "front_active_facets": barrel_step_summary["front_active_facets"],
+                        "front_localization_ratio": (
+                            f"{barrel_step_summary['front_localization_ratio']:.6e}"
+                        ),
+                        "front_vs_crown_opening_ratio": (
+                            f"{barrel_step_summary['front_vs_crown_opening_ratio']:.6e}"
+                        ),
+                        "crown_vs_junction_opening_ratio": (
+                            f"{barrel_step_summary['crown_vs_junction_opening_ratio']:.6e}"
+                        ),
+                        "junction_opening_ratio": (
+                            f"{barrel_step_summary['junction_opening_ratio']:.6e}"
+                        ),
+                        "junction_damage_ratio": (
+                            f"{barrel_step_summary['junction_damage_ratio']:.6e}"
+                        ),
+                        "first_damage_seen": int(event_state["first_damage"] is not None),
+                        "first_gap_seen": int(
+                            event_state["first_visible_gap"] is not None
+                        ),
+                        "first_junction_opening_seen": int(
+                            event_state["first_junction_opening"] is not None
+                        ),
                     })
                     csv_file.flush()
 
@@ -1318,6 +1749,15 @@ def run_simulation(
                 total_time_newton + total_time_perzyna + total_time_proj + total_time_io
             )
             if comm.rank == 0:
+                if barrel_output_cfg["enabled"] and cell_output_data is not None:
+                    finalize_barrel_vault_results(
+                        run_dir=run_dir,
+                        cfg=cfg,
+                        output_cfg=barrel_output_cfg,
+                        event_state=event_state,
+                        peak_state=peak_state,
+                        final_step_summary=final_step_summary,
+                    )
                 log_message("")
                 log_message("  ========================================================================")
                 log_message("  SIMULATION COMPLETE")
@@ -1346,9 +1786,19 @@ def run_simulation(
                 log_message("  ========================================================================")
                 log_message(f"  Log saved to: {log_path}")
                 log_message(f"  CSV metrics saved to: {csv_path}")
+                if barrel_output_cfg["enabled"] and cell_output_data is not None:
+                    log_message(f"  Barrel-vault results saved to: {results_path}")
+                    if span_profiles_writer is not None:
+                        log_message(f"  Span profiles saved to: {span_profiles_path}")
+                    if facet_history_writer is not None:
+                        log_message(f"  Facet history saved to: {facet_history_path}")
             # Close CSV file after loop completes (before finally).
             if csv_file is not None:
                 csv_file.close()
+            if facet_history_file is not None:
+                facet_history_file.close()
+            if span_profiles_file is not None:
+                span_profiles_file.close()
     finally:
         if newton_workspace is not None:
             newton_workspace.destroy()

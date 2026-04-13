@@ -9,19 +9,25 @@
 # Geometry Parameters
 # -----------------------------------------------------------------------------
 geometry:
-  span: 1000.0          # Vault span/width [mm]
-  length: 1000.0        # Vault length/extrusion direction [mm]
-  rise: 240.0           # Vault rise/height at crown [mm]
+  span: 1200.0          # Vault span/width [mm]
+  length: 210.0        # Vault length/extrusion direction [mm]
+  rise: 300.0           # Vault rise/height at crown [mm]
   thickness: 25.0       # Shell thickness [mm]
+
+# -----------------------------------------------------------------------------
+# Boundary Conditions
+# -----------------------------------------------------------------------------
+boundary_conditions:
+  intrados_dirichlet_upto_layer: 10  # 0-based, inclusive
 
 # -----------------------------------------------------------------------------
 # Mesh Discretization
 # -----------------------------------------------------------------------------
 mesh:
-  n_length: 100        # Divisions along length
-  n_span: 110           # Divisions along span
+  n_length: 15        # Divisions along length
+  n_span: 150           # Divisions along span
   n_thickness: 1        # Divisions through thickness
-  partitioner: strip   # strip | default (ParMETIS/SCOTCH)
+  partitioner: default   # strip | default (ParMETIS/SCOTCH)
 
 # -----------------------------------------------------------------------------
 # Rheology Inputs 
@@ -52,7 +58,7 @@ interface:
   # Penalizes displacement jumps between DG elements within the same layer.
   # Actual penalty stiffness = gamma_bonded_mult * E / h_avg.
   # Higher -> stiffer coupling (less interpenetration), but too high -> ill-conditioning.
-  gamma_bonded_mult: 40.0
+  gamma_bonded_mult: 200.0
 
   # Weak Dirichlet (Nitsche) penalty: same idea, applied at fixed boundaries.
   # Actual penalty stiffness = gamma_boundary_mult * E / h_cell.
@@ -73,15 +79,9 @@ interface:
 # Activation Parameters
 # -----------------------------------------------------------------------------
 activation:
-  tcp_speed: 190.0      # Tool center point (print head) speed [mm/s]
+  tcp_speed: 80.0      # Tool center point (print head) speed [mm/s]
   sharpness: 1.0        # Tanh activation steepness [-]
   alpha_min: 1.0e-10    # Minimum stiffness multiplier for inactive cells [-]
-
-# -----------------------------------------------------------------------------
-# Boundary Conditions
-# -----------------------------------------------------------------------------
-boundary_conditions:
-  intrados_dirichlet_upto_layer: 2  # 0-based, inclusive
 
 # -----------------------------------------------------------------------------
 # Solver Parameters
@@ -143,10 +143,10 @@ solver:
 # Time Stepping
 # -----------------------------------------------------------------------------
 time_stepping:
-  n_steps: 600       # Number of time steps
+  n_steps: 100       # Number of time steps
   max_steps: 0       # Stop after this many steps (0 = run all). For benchmarking.
-  start_offset: 0.1     # Offset from minimum birth time [s]
-  end_multiplier: 1.05  # Multiplier for maximum birth time
+  start_offset: 196     # Offset from minimum birth time [s]
+  end_multiplier: 1.0  # Multiplier for maximum birth time
 
 # -----------------------------------------------------------------------------
 # Checkpoint / Restart

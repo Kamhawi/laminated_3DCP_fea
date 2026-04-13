@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import shutil
+from pathlib import Path
 
 from mpi4py import MPI
 from dolfinx import fem
@@ -38,6 +39,11 @@ from mesh import (
     tag_interfaces_and_boundaries,
 )
 from physics.weak_form import build_evp_cohesive_weak_form
+from solver.barrel_vault_output import (
+    build_cell_output_data,
+    generate_barrel_vault_figures,
+    get_barrel_vault_output_config,
+)
 from solver.time_stepper import build_cell_to_dofs_and_support, run_simulation
 
 
@@ -196,6 +202,7 @@ def main():
             perm = compute_cell_permutation(msh, vault_mesh)
             birth_times_dolfinx = reorder_cell_data(birth_times_array, perm)
             cells_layers_dolfinx = reorder_cell_data(cells_layers, perm)
+            cell_output_data = build_cell_output_data(vault_mesh, cells_lst, perm)
         except Exception as e:
             print(f"[Rank {comm.rank}] Fatal error in Step 5: {str(e)}", flush=True)
             comm.Abort(1)
@@ -315,7 +322,16 @@ def main():
             log_path,
             interior_facet_tags=interior_facet_tags,
             simulation_start_time=simulation_start_time,
+            cell_output_data=cell_output_data,
         )
+
+        if comm.rank == 0 and get_barrel_vault_output_config(cfg)["generate_figures"]:
+            try:
+                figure_paths = generate_barrel_vault_figures(Path(disp_path).parent, cfg)
+                for figure_path in figure_paths:
+                    print(f"  Figure saved to: {figure_path}", flush=True)
+            except Exception as exc:
+                print(f"  WARNING: barrel-vault figure generation failed: {exc}", flush=True)
 
         if comm.rank == 0:
             print("\nDone!", flush=True)
